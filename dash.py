@@ -218,6 +218,19 @@ def load_sessions(on_date=None, since: dt.date | None = None):
     return sessions
 
 
+def build_project_index(sessions):
+    """{lowercased key: (cwd, latest_session_id)} for both full cwd and basename(cwd).
+    Expects sessions newest-first; first hit per key wins (so latest session)."""
+    idx = {}
+    for s in sessions:
+        cwd = s.cwd
+        base = Path(cwd).name
+        for key in (cwd.lower(), base.lower()):
+            if key and key not in idx:
+                idx[key] = (cwd, s.session_id)
+    return idx
+
+
 def notion_token() -> str | None:
     env = os.environ.get("NOTION_TOKEN")
     if env:
@@ -242,6 +255,25 @@ def notion_token() -> str | None:
     except FileNotFoundError:
         pass
     return None
+
+
+def _notion_prop_text(props: dict, name: str) -> str:
+    """Extract a string from a Notion property regardless of underlying type."""
+    p = props.get(name) or {}
+    if p.get("select"):
+        return p["select"].get("name") or ""
+    if p.get("multi_select"):
+        return ", ".join(x.get("name", "") for x in p["multi_select"] if x.get("name"))
+    if p.get("status"):
+        return p["status"].get("name") or ""
+    if p.get("rich_text"):
+        return "".join(x.get("plain_text", "") for x in p["rich_text"])
+    if p.get("title"):
+        return "".join(x.get("plain_text", "") for x in p["title"])
+    if p.get("people"):
+        first = p["people"][0]
+        return first.get("name") or first.get("id") or ""
+    return ""
 
 
 def fetch_notion_todos_live(tok: str) -> list[dict] | None:
@@ -298,7 +330,12 @@ def fetch_notion_todos_live(tok: str) -> list[dict] | None:
         status = status_prop.get("name", "")
         due_prop = (props.get("Due date", {}) or {}).get("date") or {}
         due = due_prop.get("start")
-        todos.append({"name": name, "status": status, "due": due, "url": r.get("url")})
+        project = _notion_prop_text(props, "Project")
+        source = _notion_prop_text(props, "Source")
+        todos.append({
+            "name": name, "status": status, "due": due, "url": r.get("url"),
+            "project": project, "source": source,
+        })
     return todos
 
 
@@ -435,67 +472,146 @@ def render_session_card(s: Session) -> str:
         if last and last != first
         else ""
     )
+    default_open = " open" if incomplete else ""
 
     return f"""
-    <article class="session {has_incomplete}" data-sid="{s.session_id}">
-      <header>
-        <div class="meta">
-          <span class="time">{fmt_range(s.start_ts, s.end_ts)}</span>
-          <span class="duration">({fmt_duration(s.start_ts, s.end_ts)})</span>
-          {pill}
-          <span class="msgs">{s.user_msg_count} msg{'s' if s.user_msg_count != 1 else ''}</span>
-        </div>
-        <h3>{title}</h3>
-        <div class="sid">{s.session_id}</div>
-      </header>
-      <section class="prompts">
-        <div class="prompt-row"><span class="lbl">first:</span> {first}</div>
-        {last_block}
-      </section>
-      <section>{tasks_html}</section>
-      <form class="resume" action="/resume" method="post">
-        <input type="hidden" name="sid" value="{s.session_id}">
-        <input type="hidden" name="cwd" value="{html.escape(s.cwd)}">
-        <input class="prompt-input" name="prompt" placeholder="Optional direction prompt for resumed session…" autocomplete="off">
-        <button type="submit">Resume</button>
-      </form>
+    <article class="session {has_incomplete}" id="sid-{s.session_id}" data-sid="{s.session_id}">
+      <details{default_open}>
+        <summary>
+          <div class="meta">
+            <span class="time">{fmt_range(s.start_ts, s.end_ts)}</span>
+            <span class="duration">({fmt_duration(s.start_ts, s.end_ts)})</span>
+            {pill}
+            <span class="msgs">{s.user_msg_count} msg{'s' if s.user_msg_count != 1 else ''}</span>
+          </div>
+          <h3>{title}</h3>
+          <div class="sid">{s.session_id}</div>
+        </summary>
+        <section class="prompts">
+          <div class="prompt-row"><span class="lbl">first:</span> {first}</div>
+          {last_block}
+        </section>
+        <section>{tasks_html}</section>
+        <form class="resume" action="/resume" method="post">
+          <input type="hidden" name="sid" value="{s.session_id}">
+          <input type="hidden" name="cwd" value="{html.escape(s.cwd)}">
+          <input class="prompt-input" name="prompt" placeholder="Optional direction prompt for resumed session…" autocomplete="off">
+          <button type="submit">Resume</button>
+        </form>
+      </details>
     </article>
     """
 
 
-def render_notion_sidebar(todos: list[dict], source: str, fetched_at: str | None) -> str:
+def _render_todo_row(t: dict, project_index: dict, known_sids: set, today: dt.date) -> tuple[str, str]:
+    """Render one todo <li>. Returns (html, due_cls) so the caller can tally counts."""
+    name = html.escape(t.get("name", "").strip() or "(untitled)")
+    url = t.get("url", "")
+    status = t.get("status", "")
+    due = t.get("due")
+    due_cls = ""
+    due_label = ""
+    if due:
+        try:
+            d = dt.date.fromisoformat(due[:10])
+            if d < today:
+                due_cls = "overdue"
+            elif d == today:
+                due_cls = "today"
+            due_label = d.strftime("%b %d")
+        except ValueError:
+            due_label = due
+    status_cls = "inprog" if status.lower() == "in progress" else "todo"
+    due_html = f'<span class="todo-due">{html.escape(due_label)}</span>' if due_label else ""
+
+    project_name = (t.get("project") or "").strip()
+    match = project_index.get(project_name.lower()) if project_name else None
+    prompt_val = html.escape(t.get("name") or "", quote=True)
+    actions = []
+    if match:
+        cwd, latest_sid = match
+        actions.append(
+            f'<form class="todo-action" method="post" action="/start">'
+            f'<input type="hidden" name="cwd" value="{html.escape(cwd)}">'
+            f'<input type="hidden" name="prompt" value="{prompt_val}">'
+            f'<button>▶ start in {html.escape(Path(cwd).name)}</button></form>'
+        )
+        if latest_sid:
+            actions.append(
+                f'<form class="todo-action" method="post" action="/resume">'
+                f'<input type="hidden" name="sid" value="{latest_sid}">'
+                f'<input type="hidden" name="cwd" value="{html.escape(cwd)}">'
+                f'<input type="hidden" name="prompt" value="{prompt_val}">'
+                f'<button>↻ resume latest</button></form>'
+            )
+
+    source_val = (t.get("source") or "").strip()
+    if source_val and source_val in known_sids:
+        source_html = (
+            f'<a class="todo-source" href="#sid-{html.escape(source_val)}">'
+            f'from {html.escape(source_val[:8])}</a>'
+        )
+    elif source_val:
+        source_html = f'<span class="todo-source">via {html.escape(source_val)}</span>'
+    else:
+        source_html = ""
+
+    notion_link = (
+        f'<a class="todo-open" href="{html.escape(url)}" target="_blank">open in notion ↗</a>'
+        if url else ""
+    )
+
+    body_bits = [source_html, "".join(actions), notion_link]
+    body_html = "".join(b for b in body_bits if b)
+    body_html = f'<div class="todo-body">{body_html}</div>' if body_html else ""
+
+    row = (
+        f'<li class="todo {due_cls}">'
+        f'<details>'
+        f'<summary>'
+        f'<span class="todo-status {status_cls}"></span>'
+        f'<span class="todo-name">{name}</span>'
+        f'{due_html}'
+        f'</summary>'
+        f'{body_html}'
+        f'</details>'
+        f'</li>'
+    )
+    return row, due_cls
+
+
+def render_notion_sidebar(todos: list[dict], source: str, fetched_at: str | None,
+                          project_index: dict, known_sids: set) -> str:
     today = dt.date.today()
-    rows = []
     overdue = 0
     today_count = 0
+
+    groups: dict[str, list[dict]] = {}
     for t in todos:
-        name = html.escape(t.get("name", "").strip() or "(untitled)")
-        url = t.get("url", "")
-        status = t.get("status", "")
-        due = t.get("due")
-        due_cls = ""
-        due_label = ""
-        if due:
-            try:
-                d = dt.date.fromisoformat(due[:10])
-                if d < today:
-                    due_cls = "overdue"
-                    overdue += 1
-                elif d == today:
-                    due_cls = "today"
-                    today_count += 1
-                due_label = d.strftime("%b %d")
-            except ValueError:
-                due_label = due
-        status_cls = "inprog" if status.lower() == "in progress" else "todo"
-        link_attr = f' href="{html.escape(url)}" target="_blank"' if url else ""
-        due_html = f'<span class="todo-due">{due_label}</span>' if due_label else ""
-        rows.append(
-            f'<li class="todo {due_cls}"><a{link_attr}>'
-            f'<span class="todo-status {status_cls}"></span>'
-            f'<span class="todo-name">{name}</span>'
-            f'{due_html}'
-            f'</a></li>'
+        key = (t.get("project") or "").strip() or "Unassigned"
+        groups.setdefault(key, []).append(t)
+
+    group_blocks = []
+    for project_name, items in sorted(
+        groups.items(),
+        key=lambda kv: (kv[0] == "Unassigned", -len(kv[1]), kv[0].lower()),
+    ):
+        rows = []
+        for t in items:
+            row, due_cls = _render_todo_row(t, project_index, known_sids, today)
+            rows.append(row)
+            if due_cls == "overdue":
+                overdue += 1
+            elif due_cls == "today":
+                today_count += 1
+        group_blocks.append(
+            f'<details open class="todo-group">'
+            f'<summary>'
+            f'<span class="proj-name">{html.escape(project_name)}</span>'
+            f'<span class="proj-count">{len(items)}</span>'
+            f'</summary>'
+            f'<ul class="todos">{"".join(rows)}</ul>'
+            f'</details>'
         )
 
     if source == "live":
@@ -520,7 +636,7 @@ def render_notion_sidebar(todos: list[dict], source: str, fetched_at: str | None
         counts.append(f'<span class="badge warn">{today_count} due today</span>')
     counts.append(f'<span class="badge">{len(todos)} open</span>')
 
-    body = "".join(rows) or '<li class="muted">No open todos.</li>'
+    body = "".join(group_blocks) or '<p class="muted">No open todos.</p>'
     config_hint = ""
     if source == "none":
         config_hint = (
@@ -536,7 +652,7 @@ def render_notion_sidebar(todos: list[dict], source: str, fetched_at: str | None
         <div class="sidebar-meta">{src_note} {refresh_btn}</div>
       </div>
       <div class="counts">{''.join(counts)}</div>
-      <ul class="todos">{body}</ul>
+      <div class="todo-groups">{body}</div>
       {config_hint}
     </aside>
     """
@@ -630,7 +746,7 @@ def render_usage_header(today_u: dict, week_u: dict, sub: dict | None) -> str:
 
 
 def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_at,
-                today_usage, week_usage):
+                today_usage, week_usage, project_index, known_sids):
     by_project = {}
     for s in sessions:
         by_project.setdefault(s.cwd, []).append(s)
@@ -665,7 +781,9 @@ def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_a
     plural_s = "s" if len(sessions) != 1 else ""
     body = "".join(project_blocks) or '<p class="muted">No sessions found for this date.</p>'
 
-    sidebar = render_notion_sidebar(notion_todos, notion_source, notion_fetched_at)
+    sidebar = render_notion_sidebar(
+        notion_todos, notion_source, notion_fetched_at, project_index, known_sids
+    )
     sub = load_subscription_usage()
     usage = render_usage_header(today_usage, week_usage, sub)
 
@@ -742,6 +860,37 @@ def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_a
   form.resume button:hover {{ background: #084e9b; }}
   .muted {{ color: #999; font-style: italic; padding: 6px; }}
   .project {{ margin-bottom: 12px; }}
+
+  /* Collapsible todo groups in sidebar */
+  details.todo-group {{ margin-bottom: 4px; }}
+  details.todo-group > summary {{ cursor: pointer; padding: 6px 4px 2px; font-size: 12px; font-weight: 600; color: #444; list-style: none; display: flex; align-items: baseline; gap: 6px; }}
+  details.todo-group > summary::-webkit-details-marker {{ display: none; }}
+  details.todo-group > summary::before {{ content: "▸"; color: #aaa; font-size: 9px; }}
+  details.todo-group[open] > summary::before {{ content: "▾"; }}
+  details.todo-group > summary:hover {{ background: #efefef; border-radius: 4px; }}
+  .proj-name {{ flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .proj-count {{ color: #999; font-weight: 400; font-size: 11px; }}
+
+  /* Per-todo collapsible details */
+  .todo details > summary {{ cursor: pointer; display: flex; gap: 6px; align-items: center; padding: 5px 6px; list-style: none; font-size: 12px; }}
+  .todo details > summary::-webkit-details-marker {{ display: none; }}
+  .todo details > summary:hover {{ background: #e9e9e9; border-radius: 4px; }}
+  .todo-body {{ padding: 4px 8px 8px 22px; display: flex; flex-direction: column; gap: 4px; }}
+  .todo-body form.todo-action {{ display: inline; margin: 0; }}
+  .todo-body form.todo-action button {{ font-size: 11px; padding: 3px 8px; border: 1px solid #ccc; background: #fff; border-radius: 4px; cursor: pointer; color: #333; }}
+  .todo-body form.todo-action button:hover {{ background: #eef; }}
+  .todo-source {{ font-size: 11px; color: #666; }}
+  a.todo-source {{ color: #0a64c4; text-decoration: none; }}
+  a.todo-source:hover {{ text-decoration: underline; }}
+  .todo-open {{ font-size: 11px; color: #0a64c4; text-decoration: none; }}
+  .todo-open:hover {{ text-decoration: underline; }}
+
+  /* Collapsible session cards */
+  .session details > summary {{ cursor: pointer; list-style: none; }}
+  .session details > summary::-webkit-details-marker {{ display: none; }}
+  .session details > summary::after {{ content: "▾"; float: right; color: #bbb; font-size: 10px; margin-top: 2px; }}
+  .session details:not([open]) > summary::after {{ content: "▸"; }}
+  .session details > summary:hover h3 {{ color: #0a64c4; }}
 </style>
 </head><body>
 <header class="top">
@@ -765,6 +914,25 @@ def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_a
 </main>
 </body></html>
 """
+
+
+def launch_start(cwd: str, prompt: str):
+    if not Path(cwd).exists():
+        return False, f"cwd does not exist: {cwd}"
+    cmd = f"cd {shlex.quote(cwd)} && claude"
+    if prompt.strip():
+        cmd += f" {shlex.quote(prompt.strip())}"
+    osascript = (
+        'tell application "Terminal"\n'
+        "  activate\n"
+        f"  do script {json.dumps(cmd)}\n"
+        "end tell"
+    )
+    try:
+        subprocess.run(["osascript", "-e", osascript], check=True, capture_output=True)
+        return True, cmd
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr.decode("utf-8", errors="replace")
 
 
 def launch_resume(session_id: str, cwd: str, prompt: str):
@@ -810,8 +978,11 @@ class Handler(BaseHTTPRequestHandler):
             today_usage = usage_totals(today_sessions)
             week_usage = usage_totals(week_sessions)
             todos, source, fetched_at = load_notion_todos()
+            project_index = build_project_index(week_sessions)
+            known_sids = {s.session_id for s in week_sessions}
             body = render_page(
-                day_sessions, on_date, todos, source, fetched_at, today_usage, week_usage
+                day_sessions, on_date, todos, source, fetched_at,
+                today_usage, week_usage, project_index, known_sids,
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -839,6 +1010,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
+            return
+        if parsed.path == "/start":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+            cwd = form.get("cwd", "").strip()
+            prompt = form.get("prompt", "")
+            if not cwd:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"missing cwd")
+                return
+            ok, info = launch_start(cwd, prompt)
+            if ok:
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+            else:
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(info.encode("utf-8"))
             return
         if parsed.path != "/resume":
             self.send_response(404)
