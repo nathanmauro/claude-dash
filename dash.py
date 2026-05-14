@@ -192,9 +192,13 @@ def parse_session(path: Path):
     return sess
 
 
-def load_sessions(on_date=None, since: dt.date | None = None):
-    """If on_date set, return sessions ending on that day; if since set, sessions
-    ending on/after that date; otherwise all sessions."""
+def load_sessions(on_date=None, since: dt.date | None = None, until: dt.date | None = None):
+    """Filter sessions by local ending date.
+    - on_date: exact day match
+    - since + until: inclusive range
+    - since only: from that date onwards
+    - until only: up to that date
+    Otherwise return all sessions."""
     sessions = []
     if not PROJECTS_DIR.exists():
         return sessions
@@ -209,6 +213,8 @@ def load_sessions(on_date=None, since: dt.date | None = None):
             if on_date and local_end != on_date:
                 continue
             if since and (not local_end or local_end < since):
+                continue
+            if until and (not local_end or local_end > until):
                 continue
             sessions.append(s)
     sessions.sort(
@@ -426,10 +432,10 @@ def truncate(s: str, n: int = 180) -> str:
     return s[: n - 1] + "…"
 
 
-STATUS_BADGE = {
-    "completed": ("done", "#1f7a3a"),
-    "in_progress": ("in-progress", "#9a6b00"),
-    "pending": ("pending", "#7a1f1f"),
+STATUS_LABEL = {
+    "completed": "done",
+    "in_progress": "in-prog",
+    "pending": "todo",
 }
 
 
@@ -447,9 +453,9 @@ def render_session_card(s: Session) -> str:
 
     task_rows = []
     for task in s.tasks.values():
-        label, color = STATUS_BADGE.get(task.status, (task.status, "#555"))
+        label = STATUS_LABEL.get(task.status, task.status)
         task_rows.append(
-            f'<li><span class="status" style="background:{color}">{label}</span>'
+            f'<li><span class="status {html.escape(task.status)}">{html.escape(label)}</span>'
             f'<span class="subject">{html.escape(task.subject)}</span></li>'
         )
     tasks_html = (
@@ -457,6 +463,11 @@ def render_session_card(s: Session) -> str:
         if task_rows
         else '<p class="muted">No tracked tasks.</p>'
     )
+
+    search_blob = " ".join(filter(None, [
+        s.title, s.first_prompt, s.last_prompt, s.cwd, s.session_id,
+        " ".join(t.subject for t in s.tasks.values()),
+    ])).lower()
 
     first = (
         html.escape(truncate(s.first_prompt, 220))
@@ -468,35 +479,37 @@ def render_session_card(s: Session) -> str:
     title = html.escape(s.title or s.first_prompt[:80] or s.session_id)
     has_incomplete = "warn" if incomplete else ""
     last_block = (
-        f'<div class="prompt-row"><span class="lbl">last:</span> {last}</div>'
+        f'<div class="prompt-row"><span class="lbl">last</span> {last}</div>'
         if last and last != first
         else ""
     )
     default_open = " open" if incomplete else ""
+    tokens_sub = f'<span class="tokens">{fmt_tokens(s.billable_tokens)} tok</span>' if s.billable_tokens else ""
 
     return f"""
-    <article class="session {has_incomplete}" id="sid-{s.session_id}" data-sid="{s.session_id}">
+    <article class="session {has_incomplete}" id="sid-{s.session_id}" data-sid="{s.session_id}" data-search="{html.escape(search_blob, quote=True)}">
       <details{default_open}>
         <summary>
           <div class="meta">
             <span class="time">{fmt_range(s.start_ts, s.end_ts)}</span>
-            <span class="duration">({fmt_duration(s.start_ts, s.end_ts)})</span>
-            {pill}
+            <span class="duration">{fmt_duration(s.start_ts, s.end_ts)}</span>
             <span class="msgs">{s.user_msg_count} msg{'s' if s.user_msg_count != 1 else ''}</span>
+            {tokens_sub}
+            {pill}
           </div>
           <h3>{title}</h3>
-          <div class="sid">{s.session_id}</div>
+          <div class="sid" title="click to copy" data-sid="{s.session_id}">{s.session_id}</div>
         </summary>
         <section class="prompts">
-          <div class="prompt-row"><span class="lbl">first:</span> {first}</div>
+          <div class="prompt-row"><span class="lbl">first</span> {first}</div>
           {last_block}
         </section>
         <section>{tasks_html}</section>
         <form class="resume" action="/resume" method="post">
           <input type="hidden" name="sid" value="{s.session_id}">
           <input type="hidden" name="cwd" value="{html.escape(s.cwd)}">
-          <input class="prompt-input" name="prompt" placeholder="Optional direction prompt for resumed session…" autocomplete="off">
-          <button type="submit">Resume</button>
+          <input class="prompt-input" name="prompt" placeholder="Optional direction for resumed session…" autocomplete="off">
+          <button type="submit">Resume ↻</button>
         </form>
       </details>
     </article>
@@ -703,7 +716,9 @@ def _rate_block(label: str, rl: dict | None) -> str:
     """
 
 
-def render_usage_header(today_u: dict, week_u: dict, sub: dict | None) -> str:
+def render_usage_header(today_u: dict, week_u: dict, range_u: dict,
+                        range_label: str, is_today_only: bool,
+                        sub: dict | None) -> str:
     cache_pct = today_u["cache_hit_pct"]
     sub_blocks = ""
     if sub and sub.get("rate_limits"):
@@ -723,13 +738,24 @@ def render_usage_header(today_u: dict, week_u: dict, sub: dict | None) -> str:
             except (TypeError, ValueError):
                 pass
     cost_sub = f" · {cost}" if cost else ""
-    return f"""
-    <div class="usage">
+
+    if is_today_only:
+        first_block = f"""
       <div class="usage-block">
         <div class="lbl">Today</div>
         <div class="val">{fmt_tokens(today_u['billable'])}</div>
         <div class="sub">{today_u['session_count']} session{'s' if today_u['session_count'] != 1 else ''}{cost_sub}</div>
-      </div>
+      </div>"""
+    else:
+        first_block = f"""
+      <div class="usage-block">
+        <div class="lbl">Range</div>
+        <div class="val">{fmt_tokens(range_u['billable'])}</div>
+        <div class="sub">{range_u['session_count']} session{'s' if range_u['session_count'] != 1 else ''} · {html.escape(range_label)}</div>
+      </div>"""
+
+    return f"""
+    <div class="usage">{first_block}
       <div class="usage-block">
         <div class="lbl">Last 7d</div>
         <div class="val">{fmt_tokens(week_u['billable'])}</div>
@@ -738,15 +764,20 @@ def render_usage_header(today_u: dict, week_u: dict, sub: dict | None) -> str:
       <div class="usage-block">
         <div class="lbl">Cache hit</div>
         <div class="val">{cache_pct:.0f}%</div>
-        <div class="sub">{fmt_tokens(today_u['cache_read'])} cached</div>
+        <div class="sub">{fmt_tokens(today_u['cache_read'])} cached today</div>
       </div>
       {sub_blocks}
     </div>
     """
 
 
-def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_at,
-                today_usage, week_usage, project_index, known_sids):
+def _home_collapse(p: str) -> str:
+    home = str(Path.home())
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+def render_page(sessions, start_d, end_d, notion_todos, notion_source, notion_fetched_at,
+                today_usage, week_usage, range_usage, project_index, known_sids):
     by_project = {}
     for s in sessions:
         by_project.setdefault(s.cwd, []).append(s)
@@ -762,156 +793,692 @@ def render_page(sessions, on_date, notion_todos, notion_source, notion_fetched_a
         group.sort(key=lambda s: (0 if s.incomplete_tasks else 1, -(s.end_ts.timestamp() if s.end_ts else 0)))
         cards = "".join(render_session_card(s) for s in group)
         plural = "s" if len(group) != 1 else ""
-        open_note = f", {open_in_group} open" if open_in_group else ""
+        base = Path(cwd).name or cwd
+        open_note = f' · <span class="open">{open_in_group} open</span>' if open_in_group else ""
         project_blocks.append(
             f'<section class="project">'
-            f'<h2>{html.escape(cwd)} <small>{len(group)} session{plural}{open_note}</small></h2>'
+            f'<h2 class="proj-head">'
+            f'<span class="proj-base">{html.escape(base)}</span>'
+            f'<span class="proj-path">{html.escape(_home_collapse(cwd))}</span>'
+            f'<span class="proj-meta">{len(group)} session{plural}{open_note}</span>'
+            f'</h2>'
             f"{cards}</section>"
         )
 
     today = dt.date.today()
-    nav_prev = (on_date - dt.timedelta(days=1)).isoformat()
-    nav_next = (on_date + dt.timedelta(days=1)).isoformat()
-    today_link = '<a href="/">today</a>' if on_date != today else ""
+    is_today_only = start_d == today and end_d == today
+    is_single_day = start_d == end_d
+    span_days = (end_d - start_d).days + 1
+
+    # Shift entire range by 1 day for prev/next arrows.
+    prev_from = (start_d - dt.timedelta(days=1)).isoformat()
+    prev_to = (end_d - dt.timedelta(days=1)).isoformat()
+    next_from = (start_d + dt.timedelta(days=1)).isoformat()
+    next_to = (end_d + dt.timedelta(days=1)).isoformat()
+
+    # Quick-range URLs + active states.
+    q_today = "/"
+    q_7d = f"/?from={(today - dt.timedelta(days=6)).isoformat()}&to={today.isoformat()}"
+    q_30d = f"/?from={(today - dt.timedelta(days=29)).isoformat()}&to={today.isoformat()}"
+    cls_today = "active" if is_today_only else ""
+    cls_7d = "active" if (start_d == today - dt.timedelta(days=6) and end_d == today) else ""
+    cls_30d = "active" if (start_d == today - dt.timedelta(days=29) and end_d == today) else ""
+
+    if is_single_day:
+        if start_d == today:
+            range_label = "today"
+        else:
+            range_label = start_d.isoformat()
+    else:
+        range_label = f"{start_d.isoformat()} → {end_d.isoformat()} ({span_days}d)"
+
     open_strong = (
-        f' · <strong>{total_open} open task{"s" if total_open != 1 else ""}</strong>'
+        f' · <strong class="open-count">{total_open} open task{"s" if total_open != 1 else ""}</strong>'
         if total_open
         else ""
     )
     plural_s = "s" if len(sessions) != 1 else ""
-    body = "".join(project_blocks) or '<p class="muted">No sessions found for this date.</p>'
+    tokens_note = f' · {fmt_tokens(range_usage["billable"])} tokens' if range_usage["billable"] else ""
+    body = "".join(project_blocks) or (
+        '<div class="empty">'
+        '<div class="empty-mark">∅</div>'
+        '<p>No sessions in this range.</p>'
+        f'<p class="muted">{html.escape(range_label)}</p>'
+        '</div>'
+    )
 
     sidebar = render_notion_sidebar(
         notion_todos, notion_source, notion_fetched_at, project_index, known_sids
     )
     sub = load_subscription_usage()
-    usage = render_usage_header(today_usage, week_usage, sub)
+    usage = render_usage_header(today_usage, week_usage, range_usage, range_label, is_today_only, sub)
 
     return f"""<!doctype html>
-<html><head><meta charset="utf-8">
-<title>Claude dashboard — {on_date.isoformat()}</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-dash · {html.escape(range_label)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+  :root {{
+    --bg: #0c0d0f;
+    --surface: #131418;
+    --surface-2: #1a1c21;
+    --surface-3: #22242a;
+    --line: #26282d;
+    --line-2: #34373c;
+    --line-3: #44474d;
+    --text: #e6e7ea;
+    --dim: #8a8d94;
+    --muted: #54575e;
+    --accent: #cc785c;
+    --accent-hi: #e08c70;
+    --accent-tint: rgba(204,120,92,0.13);
+    --good: #86c39b;
+    --good-tint: rgba(134,195,155,0.12);
+    --warn: #e3b56b;
+    --warn-tint: rgba(227,181,107,0.13);
+    --bad: #e08a82;
+    --bad-tint: rgba(224,138,130,0.12);
+  }}
   * {{ box-sizing: border-box; }}
-  body {{ font: 14px/1.45 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; margin: 0; padding: 0; color: #1c1c1e; background: #f5f5f7; }}
-  header.top {{ background: #fff; border-bottom: 1px solid #e0e0e0; padding: 14px 24px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 10; }}
-  header.top h1 {{ font-size: 18px; margin: 0; }}
-  .usage {{ display: flex; gap: 18px; margin-left: auto; }}
-  .usage-block {{ text-align: center; min-width: 90px; }}
-  .usage-block .lbl {{ font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }}
-  .usage-block .val {{ font-size: 20px; font-weight: 600; color: #1c1c1e; line-height: 1.1; }}
-  .usage-block .val.warn {{ color: #92400e; }}
-  .usage-block .val.bad {{ color: #991b1b; }}
-  .usage-block .val.good {{ color: #166534; }}
-  .usage-block .sub {{ font-size: 11px; color: #888; }}
-  nav {{ display: flex; gap: 8px; align-items: center; }}
-  nav a, nav input {{ font: inherit; }}
-  nav a {{ color: #0a64c4; text-decoration: none; padding: 4px 10px; border-radius: 6px; background: #fff; border: 1px solid #ddd; font-size: 13px; }}
-  nav input[type=date] {{ padding: 4px 6px; border: 1px solid #ccc; border-radius: 6px; }}
-  main {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 0; }}
-  aside.sidebar {{ background: #fafafa; border-right: 1px solid #e0e0e0; padding: 16px 14px; min-height: calc(100vh - 60px); }}
-  .sidebar-head {{ display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }}
-  .sidebar-head h2 {{ font-size: 14px; margin: 0; color: #444; }}
-  .sidebar-meta .src {{ font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-right: 4px; }}
-  .src.ok {{ background: #dcfce7; color: #166534; }}
-  .src.stale {{ background: #fef3c7; color: #92400e; }}
-  .src.none {{ background: #fee2e2; color: #991b1b; }}
-  button.mini {{ font-size: 10px; padding: 1px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; color: #444; }}
-  button.mini:hover {{ background: #eee; }}
-  .counts {{ display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }}
-  .badge {{ font-size: 10px; padding: 2px 7px; border-radius: 8px; background: #e5e5e5; color: #444; }}
-  .badge.warn {{ background: #fef3c7; color: #92400e; }}
-  .badge.bad {{ background: #fee2e2; color: #991b1b; }}
-  ul.todos {{ list-style: none; padding: 0; margin: 0; }}
-  ul.todos li.todo a {{ display: flex; gap: 6px; align-items: center; padding: 5px 6px; text-decoration: none; color: #1c1c1e; border-radius: 4px; font-size: 12px; line-height: 1.3; }}
-  ul.todos li.todo a:hover {{ background: #e9e9e9; }}
-  .todo-status {{ width: 8px; height: 8px; border-radius: 50%; background: #999; flex-shrink: 0; }}
-  .todo-status.inprog {{ background: #0a64c4; }}
-  .todo-name {{ flex: 1; min-width: 0; }}
-  .todo-due {{ font-size: 10px; color: #888; white-space: nowrap; }}
-  .todo.overdue .todo-name {{ color: #991b1b; font-weight: 600; }}
-  .todo.overdue .todo-due {{ color: #991b1b; }}
-  .todo.today .todo-due {{ color: #92400e; font-weight: 600; }}
-  .hint {{ font-size: 11px; color: #666; margin-top: 12px; }}
-  .hint code {{ display: block; background: #1c1c1e; color: #f5f5f7; padding: 6px 8px; border-radius: 4px; font-size: 10px; margin-top: 4px; word-break: break-all; }}
-  section.content {{ padding: 20px 24px; max-width: 1000px; }}
-  h2 {{ font-size: 15px; margin: 28px 0 10px; color: #444; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
-  h2:first-child {{ margin-top: 0; }}
-  h2 small {{ color: #999; font-weight: 400; margin-left: 8px; }}
-  h3 {{ font-size: 15px; margin: 2px 0 4px; font-weight: 600; }}
-  .summary {{ color: #555; margin-bottom: 6px; }}
-  .session {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px 14px; margin: 8px 0; }}
-  .session.warn {{ border-left: 4px solid #d97706; }}
-  .session header {{ display: flex; flex-direction: column; }}
-  .meta {{ font-size: 12px; color: #777; display: flex; gap: 8px; align-items: center; }}
-  .sid {{ font: 11px ui-monospace, Menlo, monospace; color: #aaa; margin-top: 2px; }}
-  .pill {{ font-size: 11px; padding: 1px 8px; border-radius: 10px; }}
-  .pill.warn {{ background: #fef3c7; color: #92400e; }}
-  .pill.ok {{ background: #dcfce7; color: #166534; }}
-  .prompts {{ margin: 8px 0; font-size: 13px; color: #333; }}
-  .prompt-row {{ margin: 2px 0; }}
-  .prompt-row .lbl {{ color: #888; font-size: 11px; margin-right: 4px; text-transform: uppercase; }}
-  .tasks {{ list-style: none; padding: 0; margin: 6px 0; }}
-  .tasks li {{ display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; }}
-  .tasks .status {{ display: inline-block; min-width: 90px; text-align: center; font-size: 10px; padding: 2px 6px; border-radius: 3px; color: white; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }}
-  .tasks .subject {{ flex: 1; }}
-  form.resume {{ display: flex; gap: 6px; margin-top: 10px; }}
-  form.resume input.prompt-input {{ flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }}
-  form.resume button {{ padding: 6px 14px; background: #0a64c4; color: white; border: 0; border-radius: 6px; cursor: pointer; font: inherit; }}
-  form.resume button:hover {{ background: #084e9b; }}
-  .muted {{ color: #999; font-style: italic; padding: 6px; }}
-  .project {{ margin-bottom: 12px; }}
+  html, body {{ background: var(--bg); }}
+  body {{
+    margin: 0;
+    color: var(--text);
+    font: 14px/1.55 "IBM Plex Sans", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: 0.005em;
+  }}
+  body::before {{
+    content: "";
+    position: fixed; inset: 0;
+    pointer-events: none; z-index: 1;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(204,120,92,0.04), transparent 60%),
+      radial-gradient(900px 500px at -10% 50%, rgba(134,195,155,0.025), transparent 60%);
+  }}
 
-  /* Collapsible todo groups in sidebar */
-  details.todo-group {{ margin-bottom: 4px; }}
-  details.todo-group > summary {{ cursor: pointer; padding: 6px 4px 2px; font-size: 12px; font-weight: 600; color: #444; list-style: none; display: flex; align-items: baseline; gap: 6px; }}
+  /* Header bar */
+  header.top {{
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(12,13,15,0.86);
+    backdrop-filter: blur(12px) saturate(140%);
+    -webkit-backdrop-filter: blur(12px) saturate(140%);
+    border-bottom: 1px solid var(--line);
+    padding: 12px 24px;
+    display: flex; align-items: center;
+    gap: 18px; flex-wrap: wrap;
+  }}
+  .brand {{ display: flex; align-items: center; gap: 10px; }}
+  .brand-dot {{
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+    animation: pulse 2.8s ease-in-out infinite;
+  }}
+  @keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
+  header.top h1 {{
+    font: 600 13px/1 "JetBrains Mono", monospace;
+    margin: 0; color: var(--text);
+    letter-spacing: 0.1em; text-transform: uppercase;
+  }}
+  .brand-sep {{ color: var(--accent); margin: 0 1px; }}
+
+  /* Range picker */
+  .range-picker {{
+    display: flex; align-items: center; gap: 6px;
+    font-family: "JetBrains Mono", monospace; font-size: 12px;
+  }}
+  .range-picker .step {{
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 30px;
+    color: var(--dim);
+    text-decoration: none;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    transition: 80ms;
+  }}
+  .range-picker .step:hover {{ color: var(--accent); border-color: var(--line-2); }}
+  .range-form {{
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 0 6px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    height: 30px;
+  }}
+  .range-form input[type=date] {{
+    background: transparent; border: 0;
+    color: var(--text); font: inherit;
+    padding: 5px 4px;
+    color-scheme: dark;
+    cursor: pointer; outline: none;
+  }}
+  .range-form input[type=date]:focus {{ color: var(--accent); }}
+  .range-form .sep {{ color: var(--muted); font-size: 11px; padding: 0 2px; }}
+  .range-picker .quick {{
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    overflow: hidden;
+    margin-left: 2px;
+    height: 30px;
+  }}
+  .range-picker .quick a {{
+    padding: 7px 12px;
+    color: var(--dim);
+    text-decoration: none;
+    font-size: 11px;
+    border-right: 1px solid var(--line);
+    transition: 80ms;
+    display: inline-flex; align-items: center;
+  }}
+  .range-picker .quick a:last-child {{ border-right: 0; }}
+  .range-picker .quick a:hover {{ color: var(--text); background: var(--surface-2); }}
+  .range-picker .quick a.active {{ color: var(--accent); background: var(--surface-2); }}
+
+  /* Usage strip */
+  .usage {{
+    display: flex; margin-left: auto;
+    border-left: 1px solid var(--line);
+    font-family: "JetBrains Mono", monospace;
+  }}
+  .usage-block {{
+    padding: 0 16px;
+    border-right: 1px solid var(--line);
+    min-width: 92px;
+    text-align: left;
+  }}
+  .usage-block:last-child {{ border-right: 0; }}
+  .usage-block .lbl {{
+    font-size: 9px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.14em;
+    margin-bottom: 4px;
+  }}
+  .usage-block .val {{
+    font-size: 18px; font-weight: 600; line-height: 1;
+    color: var(--text);
+    font-feature-settings: "tnum","ss01";
+  }}
+  .usage-block .val.good {{ color: var(--good); }}
+  .usage-block .val.warn {{ color: var(--warn); }}
+  .usage-block .val.bad {{ color: var(--bad); }}
+  .usage-block .sub {{ font-size: 10px; color: var(--dim); margin-top: 4px; }}
+
+  /* Layout */
+  main {{
+    display: grid;
+    grid-template-columns: 320px minmax(0, 1fr);
+    position: relative; z-index: 2;
+  }}
+  aside.sidebar {{
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    padding: 18px 16px;
+    position: sticky; top: 65px;
+    align-self: start;
+    max-height: calc(100vh - 65px);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-2) transparent;
+  }}
+  aside.sidebar::-webkit-scrollbar {{ width: 6px; }}
+  aside.sidebar::-webkit-scrollbar-thumb {{ background: var(--line-2); border-radius: 3px; }}
+
+  .sidebar-head {{
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 12px;
+  }}
+  .sidebar-head h2 {{
+    font: 600 10px/1 "JetBrains Mono", monospace;
+    color: var(--dim); margin: 0;
+    text-transform: uppercase; letter-spacing: 0.16em;
+  }}
+  .sidebar-meta {{ display: flex; align-items: center; gap: 6px; }}
+  .sidebar-meta .src {{
+    font: 600 9px/1 "JetBrains Mono", monospace;
+    padding: 3px 7px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }}
+  .src.ok {{ background: var(--good-tint); color: var(--good); }}
+  .src.stale {{ background: var(--warn-tint); color: var(--warn); }}
+  .src.none {{ background: var(--bad-tint); color: var(--bad); }}
+  button.mini {{
+    font: 9px/1 "JetBrains Mono", monospace;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 4px 7px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 3px; color: var(--dim); cursor: pointer;
+    transition: 80ms;
+  }}
+  button.mini:hover {{ color: var(--accent); border-color: var(--line-2); }}
+  .counts {{ display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }}
+  .badge {{
+    font: 9px/1 "JetBrains Mono", monospace;
+    padding: 3px 7px; border-radius: 3px;
+    background: var(--surface-3); color: var(--dim);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }}
+  .badge.warn {{ background: var(--warn-tint); color: var(--warn); }}
+  .badge.bad {{ background: var(--bad-tint); color: var(--bad); }}
+
+  /* Todo groups */
+  .todo-groups {{ display: flex; flex-direction: column; gap: 2px; }}
+  details.todo-group {{ margin: 0; }}
+  details.todo-group > summary {{
+    cursor: pointer;
+    padding: 7px 4px 5px;
+    font: 500 11px/1 "JetBrains Mono", monospace;
+    color: var(--text);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    list-style: none;
+    display: flex; align-items: baseline; gap: 6px;
+    border-radius: 3px;
+  }}
   details.todo-group > summary::-webkit-details-marker {{ display: none; }}
-  details.todo-group > summary::before {{ content: "▸"; color: #aaa; font-size: 9px; }}
+  details.todo-group > summary::before {{
+    content: "▸"; color: var(--muted); font-size: 8px;
+  }}
   details.todo-group[open] > summary::before {{ content: "▾"; }}
-  details.todo-group > summary:hover {{ background: #efefef; border-radius: 4px; }}
-  .proj-name {{ flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .proj-count {{ color: #999; font-weight: 400; font-size: 11px; }}
+  details.todo-group > summary:hover {{ background: var(--surface-2); }}
+  .proj-name {{
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .proj-count {{ color: var(--muted); font-weight: 400; font-size: 10px; }}
 
-  /* Per-todo collapsible details */
-  .todo details > summary {{ cursor: pointer; display: flex; gap: 6px; align-items: center; padding: 5px 6px; list-style: none; font-size: 12px; }}
+  ul.todos {{ list-style: none; padding: 0; margin: 0 0 4px; }}
+  .todo details > summary {{
+    cursor: pointer;
+    display: flex; gap: 8px; align-items: center;
+    padding: 5px 6px;
+    list-style: none;
+    font-size: 12px;
+    border-radius: 3px;
+  }}
   .todo details > summary::-webkit-details-marker {{ display: none; }}
-  .todo details > summary:hover {{ background: #e9e9e9; border-radius: 4px; }}
-  .todo-body {{ padding: 4px 8px 8px 22px; display: flex; flex-direction: column; gap: 4px; }}
-  .todo-body form.todo-action {{ display: inline; margin: 0; }}
-  .todo-body form.todo-action button {{ font-size: 11px; padding: 3px 8px; border: 1px solid #ccc; background: #fff; border-radius: 4px; cursor: pointer; color: #333; }}
-  .todo-body form.todo-action button:hover {{ background: #eef; }}
-  .todo-source {{ font-size: 11px; color: #666; }}
-  a.todo-source {{ color: #0a64c4; text-decoration: none; }}
-  a.todo-source:hover {{ text-decoration: underline; }}
-  .todo-open {{ font-size: 11px; color: #0a64c4; text-decoration: none; }}
-  .todo-open:hover {{ text-decoration: underline; }}
+  .todo details > summary:hover {{ background: var(--surface-2); }}
+  .todo-status {{
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+  }}
+  .todo-status.inprog {{ background: var(--accent); box-shadow: 0 0 6px var(--accent); }}
+  .todo-name {{
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .todo-due {{
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px; color: var(--dim); white-space: nowrap;
+  }}
+  .todo.overdue .todo-name {{ color: var(--bad); font-weight: 500; }}
+  .todo.overdue .todo-due {{ color: var(--bad); }}
+  .todo.today .todo-due {{ color: var(--warn); font-weight: 600; }}
 
-  /* Collapsible session cards */
-  .session details > summary {{ cursor: pointer; list-style: none; }}
+  .todo-body {{
+    padding: 4px 8px 8px 22px;
+    display: flex; flex-direction: column; gap: 4px;
+  }}
+  .todo-body form.todo-action {{ display: inline; margin: 0; }}
+  .todo-body form.todo-action button {{
+    font: 10px/1 "JetBrains Mono", monospace;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+    border-radius: 3px;
+    cursor: pointer; color: var(--dim);
+    letter-spacing: 0.04em;
+    transition: 80ms;
+  }}
+  .todo-body form.todo-action button:hover {{
+    color: var(--accent); border-color: var(--line-2);
+  }}
+  .todo-source {{ font-size: 11px; color: var(--muted); }}
+  a.todo-source {{ color: var(--dim); text-decoration: none; border-bottom: 1px dashed var(--line-2); }}
+  a.todo-source:hover {{ color: var(--accent); border-color: var(--accent); }}
+  .todo-open {{ font-size: 11px; color: var(--dim); text-decoration: none; }}
+  .todo-open:hover {{ color: var(--accent); }}
+
+  .hint {{ font-size: 11px; color: var(--muted); margin-top: 14px; line-height: 1.5; }}
+  .hint code {{
+    display: block;
+    background: var(--surface-3); color: var(--text);
+    padding: 8px 10px; border-radius: 4px;
+    font: 10px/1.5 "JetBrains Mono", monospace;
+    margin-top: 6px; word-break: break-all;
+    border: 1px solid var(--line);
+  }}
+
+  /* Content area */
+  section.content {{ padding: 22px 28px 60px; max-width: 1100px; }}
+  .content-head {{
+    display: flex; align-items: center; gap: 14px;
+    margin-bottom: 22px; padding-bottom: 12px;
+    border-bottom: 1px dashed var(--line);
+  }}
+  .summary {{
+    margin: 0; color: var(--dim); font-size: 13px; flex: 1;
+  }}
+  .summary .count {{
+    font-family: "JetBrains Mono", monospace;
+    color: var(--text); font-weight: 600;
+  }}
+  .summary .range {{
+    font-family: "JetBrains Mono", monospace;
+    color: var(--accent);
+  }}
+  .summary .open-count {{
+    color: var(--warn);
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 500;
+  }}
+  .filter {{
+    background: var(--surface);
+    border: 1px solid var(--line);
+    color: var(--text);
+    padding: 7px 10px;
+    border-radius: 4px;
+    font: 12px "IBM Plex Sans", sans-serif;
+    width: 220px;
+    outline: none; transition: 120ms;
+  }}
+  .filter:focus {{ border-color: var(--accent); width: 280px; }}
+  .filter::placeholder {{ color: var(--muted); }}
+
+  /* Project section */
+  .project {{ margin-bottom: 32px; }}
+  .proj-head {{
+    display: flex; align-items: baseline; gap: 12px;
+    margin: 0 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+    font: 500 15px "IBM Plex Sans", sans-serif;
+  }}
+  .proj-base {{ color: var(--text); font-weight: 600; }}
+  .proj-path {{
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; color: var(--muted);
+    letter-spacing: 0.02em;
+  }}
+  .proj-meta {{
+    margin-left: auto;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--dim);
+  }}
+  .proj-meta .open {{ color: var(--warn); }}
+
+  /* Session card */
+  .session {{
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    margin: 8px 0;
+    transition: border-color 120ms, transform 80ms;
+  }}
+  .session:hover {{ border-color: var(--line-2); }}
+  .session.warn {{ border-left: 2px solid var(--accent); }}
+  .session details > summary {{
+    cursor: pointer;
+    list-style: none;
+    padding: 14px 16px;
+    position: relative;
+  }}
   .session details > summary::-webkit-details-marker {{ display: none; }}
-  .session details > summary::after {{ content: "▾"; float: right; color: #bbb; font-size: 10px; margin-top: 2px; }}
+  .session details > summary::after {{
+    content: "▾";
+    position: absolute; right: 16px; top: 16px;
+    color: var(--muted); font-size: 10px;
+    transition: 80ms;
+  }}
   .session details:not([open]) > summary::after {{ content: "▸"; }}
-  .session details > summary:hover h3 {{ color: #0a64c4; }}
+  .session details > summary:hover h3 {{ color: var(--accent); }}
+
+  .session .meta {{
+    display: flex; gap: 10px; align-items: center;
+    font: 10px/1 "JetBrains Mono", monospace;
+    color: var(--dim);
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }}
+  .session .meta .time {{ color: var(--text); }}
+  .session .meta .duration {{ color: var(--muted); }}
+  .session h3 {{
+    font: 500 14px/1.4 "IBM Plex Sans", sans-serif;
+    margin: 0 30px 4px 0;
+    color: var(--text);
+    transition: color 80ms;
+  }}
+  .session .sid {{
+    font: 10px/1 "JetBrains Mono", monospace;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    display: inline-block;
+    padding: 2px 0;
+  }}
+  .session .sid:hover {{ color: var(--dim); }}
+  .session .sid.copied {{ color: var(--good); }}
+  .session .sid.copied::after {{ content: " ✓ copied"; }}
+
+  .pill {{
+    font: 9px/1 "JetBrains Mono", monospace;
+    padding: 3px 7px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    border: 1px solid transparent;
+  }}
+  .pill.warn {{ background: var(--warn-tint); color: var(--warn); border-color: rgba(227,181,107,0.25); }}
+  .pill.ok {{ background: var(--good-tint); color: var(--good); border-color: rgba(134,195,155,0.25); }}
+
+  .session details[open] > summary {{ border-bottom: 1px solid var(--line); }}
+  .session details > section,
+  .session details > form {{ padding: 0 16px; }}
+  .session details > section:first-of-type {{ padding-top: 12px; }}
+
+  .prompts {{
+    font-size: 13px; color: var(--text);
+    padding-top: 12px; padding-bottom: 4px;
+  }}
+  .prompt-row {{
+    margin: 4px 0;
+    display: flex; align-items: baseline; gap: 10px;
+  }}
+  .prompt-row .lbl {{
+    font: 9px/1 "JetBrains Mono", monospace;
+    color: var(--muted);
+    letter-spacing: 0.12em; text-transform: uppercase;
+    flex-shrink: 0; width: 32px;
+  }}
+
+  .tasks {{ list-style: none; padding: 0; margin: 4px 0 8px; }}
+  .tasks li {{
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 6px 0;
+    border-top: 1px dashed var(--line);
+    font-size: 13px;
+  }}
+  .tasks li:first-child {{ border-top: 0; }}
+  .tasks .status {{
+    display: inline-block;
+    min-width: 60px; text-align: center;
+    padding: 2px 6px;
+    font: 9px/1.5 "JetBrains Mono", monospace;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }}
+  .tasks .status.completed {{ background: var(--good-tint); color: var(--good); }}
+  .tasks .status.in_progress {{ background: var(--warn-tint); color: var(--warn); }}
+  .tasks .status.pending {{ background: var(--bad-tint); color: var(--bad); }}
+  .tasks .subject {{ flex: 1; color: var(--text); }}
+
+  form.resume {{
+    display: flex; gap: 8px;
+    margin-top: 14px;
+    padding-top: 12px; padding-bottom: 14px;
+    border-top: 1px dashed var(--line);
+  }}
+  form.resume input.prompt-input {{
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 7px 10px;
+    font: 13px "IBM Plex Sans", sans-serif;
+    outline: none; transition: 80ms;
+  }}
+  form.resume input.prompt-input:focus {{ border-color: var(--accent); }}
+  form.resume input.prompt-input::placeholder {{ color: var(--muted); }}
+  form.resume button {{
+    background: var(--accent);
+    color: #0c0d0f;
+    border: 0;
+    border-radius: 4px;
+    padding: 7px 16px;
+    font: 600 11px "JetBrains Mono", monospace;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    cursor: pointer; transition: 80ms;
+  }}
+  form.resume button:hover {{ background: var(--accent-hi); }}
+
+  .muted {{
+    color: var(--muted); font-style: italic;
+    padding: 8px 0; font-size: 13px;
+  }}
+
+  .empty {{
+    text-align: center; padding: 80px 0;
+    color: var(--dim);
+  }}
+  .empty-mark {{
+    font: 500 72px/1 "JetBrains Mono", monospace;
+    color: var(--line-2);
+    margin-bottom: 16px;
+  }}
+  .empty p {{ margin: 4px 0; }}
+
+  /* Keyboard hint pill */
+  .kbd {{
+    font: 9px/1 "JetBrains Mono", monospace;
+    padding: 2px 5px;
+    border: 1px solid var(--line-2);
+    border-radius: 3px;
+    color: var(--dim);
+    background: var(--surface);
+    margin: 0 2px;
+  }}
+
+  @media (max-width: 880px) {{
+    main {{ grid-template-columns: 1fr; }}
+    aside.sidebar {{
+      position: static;
+      max-height: none;
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }}
+    .usage {{ margin-left: 0; border-left: 0; }}
+  }}
 </style>
 </head><body>
 <header class="top">
-  <h1>Claude dashboard</h1>
-  <nav>
-    <a href="/?date={nav_prev}">←</a>
-    <form style="display:inline" method="get" action="/">
-      <input type="date" name="date" value="{on_date.isoformat()}" onchange="this.form.submit()">
+  <div class="brand">
+    <span class="brand-dot" aria-hidden="true"></span>
+    <h1>claude<span class="brand-sep">·</span>dash</h1>
+  </div>
+  <nav class="range-picker" aria-label="date range">
+    <a class="step" href="/?from={prev_from}&amp;to={prev_to}" title="shift 1 day earlier (←)">←</a>
+    <form method="get" action="/" class="range-form">
+      <input type="date" name="from" value="{start_d.isoformat()}" max="{end_d.isoformat()}" onchange="this.form.submit()" aria-label="from">
+      <span class="sep">→</span>
+      <input type="date" name="to" value="{end_d.isoformat()}" max="{today.isoformat()}" onchange="this.form.submit()" aria-label="to">
     </form>
-    <a href="/?date={nav_next}">→</a>
-    {today_link}
+    <a class="step" href="/?from={next_from}&amp;to={next_to}" title="shift 1 day later (→)">→</a>
+    <div class="quick">
+      <a class="{cls_today}" href="{q_today}">Today</a>
+      <a class="{cls_7d}" href="{q_7d}">7d</a>
+      <a class="{cls_30d}" href="{q_30d}">30d</a>
+    </div>
   </nav>
   {usage}
 </header>
 <main>
   {sidebar}
   <section class="content">
-    <p class="summary">{len(sessions)} session{plural_s} on {on_date.isoformat()}{open_strong}.</p>
+    <div class="content-head">
+      <p class="summary"><span class="count">{len(sessions)}</span> session{plural_s} · <span class="range">{html.escape(range_label)}</span>{open_strong}{tokens_note}</p>
+      <input id="filter" class="filter" placeholder="Filter sessions…  /  to focus" autocomplete="off">
+    </div>
     {body}
   </section>
 </main>
+<script>
+(() => {{
+  const PREV = '/?from={prev_from}&to={prev_to}';
+  const NEXT = '/?from={next_from}&to={next_to}';
+  const filter = document.getElementById('filter');
+
+  // Click-to-copy session id
+  document.querySelectorAll('.sid[data-sid]').forEach(el => {{
+    el.addEventListener('click', e => {{
+      e.preventDefault();
+      e.stopPropagation();
+      const sid = el.dataset.sid;
+      if (navigator.clipboard) {{
+        navigator.clipboard.writeText(sid).then(() => {{
+          el.classList.add('copied');
+          setTimeout(() => el.classList.remove('copied'), 1000);
+        }});
+      }}
+    }});
+  }});
+
+  // Client-side filter
+  if (filter) {{
+    const apply = () => {{
+      const q = filter.value.trim().toLowerCase();
+      document.querySelectorAll('.session').forEach(card => {{
+        const blob = card.dataset.search || '';
+        card.style.display = (!q || blob.includes(q)) ? '' : 'none';
+      }});
+      document.querySelectorAll('.project').forEach(p => {{
+        const any = [...p.querySelectorAll('.session')].some(c => c.style.display !== 'none');
+        p.style.display = any ? '' : 'none';
+      }});
+    }};
+    filter.addEventListener('input', apply);
+  }}
+
+  // Keyboard nav
+  document.addEventListener('keydown', e => {{
+    if (e.target.matches('input, textarea')) {{
+      if (e.key === 'Escape' && e.target === filter) {{
+        filter.value = '';
+        filter.dispatchEvent(new Event('input'));
+        filter.blur();
+      }}
+      return;
+    }}
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'ArrowLeft') {{ location.href = PREV; }}
+    else if (e.key === 'ArrowRight') {{ location.href = NEXT; }}
+    else if (e.key === 't') {{ location.href = '/'; }}
+    else if (e.key === '/') {{
+      e.preventDefault();
+      filter && filter.focus();
+    }}
+  }});
+}})();
+</script>
 </body></html>
 """
 
@@ -963,26 +1530,49 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             qs = urllib.parse.parse_qs(parsed.query)
-            date_str = (qs.get("date") or [dt.date.today().isoformat()])[0]
-            try:
-                on_date = dt.date.fromisoformat(date_str)
-            except ValueError:
-                on_date = dt.date.today()
-            week_start = dt.date.today() - dt.timedelta(days=6)
+            today = dt.date.today()
+
+            def parse_d(s):
+                try:
+                    return dt.date.fromisoformat(s) if s else None
+                except ValueError:
+                    return None
+
+            date_p = (qs.get("date") or [None])[0]
+            from_p = (qs.get("from") or [None])[0]
+            to_p = (qs.get("to") or [None])[0]
+
+            if date_p:
+                d = parse_d(date_p) or today
+                start_d, end_d = d, d
+            else:
+                start_d = parse_d(from_p)
+                end_d = parse_d(to_p) or today  # default upper bound = today
+                if start_d is None:
+                    start_d = end_d  # default lower bound = end (single day)
+                if start_d > end_d:
+                    start_d, end_d = end_d, start_d
+
+            week_start = today - dt.timedelta(days=6)
             week_sessions = load_sessions(since=week_start)
-            day_sessions = [s for s in week_sessions if s.end_ts and s.end_ts.astimezone().date() == on_date]
-            # Sessions for other days (older than week) — only fetch if needed
-            if on_date < week_start:
-                day_sessions = load_sessions(on_date=on_date)
-            today_sessions = [s for s in week_sessions if s.end_ts and s.end_ts.astimezone().date() == dt.date.today()]
+            today_sessions = [s for s in week_sessions if s.end_ts and s.end_ts.astimezone().date() == today]
             today_usage = usage_totals(today_sessions)
             week_usage = usage_totals(week_sessions)
+            # Range sessions: reuse week data when possible, else fetch.
+            if start_d >= week_start and end_d <= today:
+                range_sessions = [
+                    s for s in week_sessions
+                    if s.end_ts and start_d <= s.end_ts.astimezone().date() <= end_d
+                ]
+            else:
+                range_sessions = load_sessions(since=start_d, until=end_d)
+            range_usage = usage_totals(range_sessions)
             todos, source, fetched_at = load_notion_todos()
             project_index = build_project_index(week_sessions)
             known_sids = {s.session_id for s in week_sessions}
             body = render_page(
-                day_sessions, on_date, todos, source, fetched_at,
-                today_usage, week_usage, project_index, known_sids,
+                range_sessions, start_d, end_d, todos, source, fetched_at,
+                today_usage, week_usage, range_usage, project_index, known_sids,
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
