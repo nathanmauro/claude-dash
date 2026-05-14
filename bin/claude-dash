@@ -25,7 +25,18 @@ LAUNCH_LABEL="com.nathanmauro.claude-dash"
 
 mkdir -p "$CACHE_DIR"
 
+launchd_pid() {
+  launchctl list 2>/dev/null | awk -v l="$LAUNCH_LABEL" '$3==l {print $1}' | grep -E '^[0-9]+$' || true
+}
+
+launchd_loaded() {
+  launchctl list 2>/dev/null | awk -v l="$LAUNCH_LABEL" '$3==l {found=1} END {exit !found}'
+}
+
 is_running() {
+  local lpid
+  lpid=$(launchd_pid)
+  if [[ -n "$lpid" ]]; then return 0; fi
   [[ -f "$PID_FILE" ]] || return 1
   local pid
   pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -33,11 +44,31 @@ is_running() {
   kill -0 "$pid" 2>/dev/null
 }
 
+running_pid() {
+  local lpid
+  lpid=$(launchd_pid)
+  if [[ -n "$lpid" ]]; then echo "$lpid"; return; fi
+  cat "$PID_FILE" 2>/dev/null || true
+}
+
 cmd_run() {
   exec /usr/bin/env python3 "$DASH_PY" "$@"
 }
 
 cmd_start() {
+  if launchd_loaded; then
+    local lpid
+    lpid=$(launchd_pid)
+    if [[ -n "$lpid" ]]; then
+      echo "claude-dash already running via LaunchAgent (pid $lpid) → $URL"
+    else
+      launchctl kickstart "gui/$(id -u)/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+      sleep 0.5
+      lpid=$(launchd_pid)
+      echo "claude-dash started via LaunchAgent (pid ${lpid:-?}) → $URL"
+    fi
+    return 0
+  fi
   if is_running; then
     echo "claude-dash already running (pid $(cat "$PID_FILE")) → $URL"
     return 0
@@ -58,6 +89,13 @@ cmd_start() {
 }
 
 cmd_stop() {
+  if launchd_loaded; then
+    launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || \
+      launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
+    echo "claude-dash LaunchAgent stopped (use 'claude-dash install' to re-enable auto-start)"
+    rm -f "$PID_FILE"
+    return 0
+  fi
   if ! is_running; then
     echo "claude-dash not running"
     rm -f "$PID_FILE"
@@ -78,6 +116,16 @@ cmd_stop() {
 }
 
 cmd_status() {
+  if launchd_loaded; then
+    local lpid
+    lpid=$(launchd_pid)
+    if [[ -n "$lpid" ]]; then
+      echo "running via LaunchAgent (pid $lpid) → $URL"
+    else
+      echo "LaunchAgent loaded but not running → $URL"
+    fi
+    return 0
+  fi
   if is_running; then
     echo "running (pid $(cat "$PID_FILE")) → $URL"
   else
@@ -87,6 +135,14 @@ cmd_status() {
 }
 
 cmd_restart() {
+  if launchd_loaded; then
+    launchctl kickstart -k "gui/$(id -u)/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+    sleep 0.5
+    local lpid
+    lpid=$(launchd_pid)
+    echo "claude-dash restarted via LaunchAgent (pid ${lpid:-?}) → $URL"
+    return 0
+  fi
   cmd_stop || true
   cmd_start
 }
