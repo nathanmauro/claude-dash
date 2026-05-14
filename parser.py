@@ -43,6 +43,10 @@ class Session:
     def incomplete_tasks(self) -> list[Task]:
         return [t for t in self.tasks.values() if t.status != "completed"]
 
+    @property
+    def completed_tasks(self) -> list[Task]:
+        return [t for t in self.tasks.values() if t.status == "completed"]
+
 def decode_project_dir(name: str) -> str:
     if name.startswith("-"):
         return "/" + name[1:].replace("-", "/")
