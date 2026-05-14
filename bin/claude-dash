@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# claude-dash — start/stop/status the Claude Code session dashboard.
+#
+# By default targets ~/Developer/proj/claude-dash/dash.py. Override with
+# CLAUDE_DASH_PY. Port defaults to 8765, override with CLAUDE_DASH_PORT.
+
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  TARGET="$(readlink "$SOURCE")"
+  [[ "$TARGET" = /* ]] || TARGET="$(cd "$(dirname "$SOURCE")" && pwd)/$TARGET"
+  SOURCE="$TARGET"
+done
+SELF="$(cd "$(dirname "$SOURCE")" && pwd)"
+DEFAULT_DASH_PY="$(cd "$SELF/.." && pwd)/dash.py"
+DASH_PY="${CLAUDE_DASH_PY:-$DEFAULT_DASH_PY}"
+CACHE_DIR="$HOME/.claude-dash"
+PID_FILE="$CACHE_DIR/claude-dash.pid"
+LOG_FILE="$CACHE_DIR/claude-dash.log"
+PORT="${CLAUDE_DASH_PORT:-8765}"
+URL="http://127.0.0.1:${PORT}/"
+LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.nathanmauro.claude-dash.plist"
+LAUNCH_LABEL="com.nathanmauro.claude-dash"
+
+mkdir -p "$CACHE_DIR"
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+cmd_run() {
+  exec /usr/bin/env python3 "$DASH_PY" "$@"
+}
+
+cmd_start() {
+  if is_running; then
+    echo "claude-dash already running (pid $(cat "$PID_FILE")) → $URL"
+    return 0
+  fi
+  rm -f "$PID_FILE"
+  nohup /usr/bin/env CLAUDE_DASH_PORT="$PORT" python3 "$DASH_PY" --no-open \
+    >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+  disown "$pid" 2>/dev/null || true
+  sleep 0.5
+  if is_running; then
+    echo "claude-dash started (pid $pid) → $URL"
+  else
+    echo "claude-dash failed to start; tail $LOG_FILE"
+    return 1
+  fi
+}
+
+cmd_stop() {
+  if ! is_running; then
+    echo "claude-dash not running"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "claude-dash stopped"
+}
+
+cmd_status() {
+  if is_running; then
+    echo "running (pid $(cat "$PID_FILE")) → $URL"
+  else
+    echo "not running"
+    return 1
+  fi
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start
+}
+
+cmd_logs() {
+  exec tail -F "$LOG_FILE"
+}
+
+cmd_open() {
+  open "$URL"
+}
+
+cmd_install() {
+  mkdir -p "$(dirname "$LAUNCH_AGENT")"
+  cat > "$LAUNCH_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>${DASH_PY}</string>
+    <string>--no-open</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_DASH_PORT</key><string>${PORT}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${LOG_FILE}</string>
+  <key>StandardErrorPath</key><string>${LOG_FILE}</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+EOF
+  launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
+  cmd_stop >/dev/null 2>&1 || true
+  launchctl load "$LAUNCH_AGENT"
+  echo "installed → $LAUNCH_AGENT (auto-starts at login on $URL)"
+}
+
+cmd_uninstall() {
+  if [[ -f "$LAUNCH_AGENT" ]]; then
+    launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
+    rm -f "$LAUNCH_AGENT"
+    echo "uninstalled LaunchAgent"
+  else
+    echo "no LaunchAgent installed"
+  fi
+}
+
+usage() {
+  cat <<EOF
+usage: claude-dash <command>
+
+commands:
+  start          start in background, log to $LOG_FILE
+  stop           stop background instance
+  restart        stop + start
+  status         show whether running and the URL
+  run [args...]  run in foreground (passes args to dash.py)
+  logs           tail -F the log
+  open           open the dashboard in the browser
+  install        install + load a LaunchAgent (auto-start at login)
+  uninstall      unload + remove the LaunchAgent
+
+env:
+  CLAUDE_DASH_PORT   server port (default 8765)
+  CLAUDE_DASH_PY     path to dash.py (default ~/Developer/proj/claude-dash/dash.py)
+EOF
+}
+
+case "${1:-status}" in
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  status)    cmd_status ;;
+  run)       shift; cmd_run "$@" ;;
+  logs|tail) cmd_logs ;;
+  open)      cmd_open ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

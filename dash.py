@@ -1061,10 +1061,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] == "--list":
+    args = sys.argv[1:]
+    if args and args[0] == "--list":
         on_date = dt.date.today()
-        if len(sys.argv) > 2:
-            on_date = dt.date.fromisoformat(sys.argv[2])
+        if len(args) > 1:
+            on_date = dt.date.fromisoformat(args[1])
         sessions = load_sessions(on_date)
         for s in sessions:
             print(f"{fmt_local(s.start_ts)}-{fmt_local(s.end_ts)}  {s.session_id}  {s.cwd}")
@@ -1076,13 +1077,15 @@ def main() -> int:
             print()
         return 0
 
+    no_open = "--no-open" in args
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://127.0.0.1:{PORT}/"
-    print(f"Claude dashboard on {url}")
-    try:
-        subprocess.Popen(["open", url])
-    except Exception:
-        pass
+    print(f"Claude dashboard on {url}", flush=True)
+    if not no_open:
+        try:
+            subprocess.Popen(["open", url])
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
