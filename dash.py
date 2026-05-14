@@ -17,11 +17,28 @@ import shlex
 import subprocess
 import sys
 import urllib.parse
-from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import database
+import parser as p
+import threading
+
+database.init_db()
+
+import time
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# Background indexer
+def start_indexer():
+    while True:
+        try:
+            database.index_all(PROJECTS_DIR)
+        except Exception as e:
+            print(f"Indexer error: {e}")
+        time.sleep(60)
+
+threading.Thread(target=start_indexer, daemon=True).start()
 PORT = int(os.environ.get("CLAUDE_DASH_PORT", "8765"))
 DASH_CACHE = Path.home() / ".claude-dash"
 NOTION_CACHE_FILE = DASH_CACHE / "notion-todos.json"
@@ -32,196 +49,143 @@ NOTION_DB_ID = os.environ.get(
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 KEYCHAIN_ACCOUNT = "notion"
+def get_github_url(cwd: str) -> str | None:
+    config = Path(cwd) / ".git" / "config"
+    if not config.exists():
+        return None
+    try:
+        content = config.read_text()
+        for line in content.splitlines():
+            if "url =" in line:
+                url = line.split("=")[1].strip()
+                if url.startswith("git@github.com:"):
+                    return "https://github.com/" + url[15:].replace(".git", "")
+                if url.startswith("https://github.com/"):
+                    return url.replace(".git", "")
+    except Exception:
+        pass
+    return None
+
+def get_notion_project_url(project_name: str) -> str:
+    # Fallback to searching Notion by project name if we don't have the specific page ID
+    return f"https://www.notion.so/search?q={urllib.parse.quote(project_name)}"
+
+def get_augment_status(cwd: str) -> str:
+    with database.get_db() as conn:
+        row = conn.execute("SELECT augment_indexed_at FROM project_meta WHERE cwd = ?", (cwd,)).fetchone()
+        if row and row['augment_indexed_at']:
+            return f"indexed at {row['augment_indexed_at'][:16]}"
+    if (Path(cwd) / ".augment").exists():
+        return "indexed"
+    return "not indexed"
+
 KEYCHAIN_SERVICE = "todo-cli"
 
+def render_icon_row(cwd: str, project_name: str) -> str:
+    gh_url = get_github_url(cwd)
+    notion_url = get_notion_project_url(project_name)
+    aug_status = get_augment_status(cwd)
 
-@dataclass
-class Task:
-    task_id: str
-    subject: str
-    description: str
-    status: str = "pending"  # pending | in_progress | completed
+    icons = []
 
+    # Finder
+    icons.append(f'''
+        <a class="icon-btn" href="/open-finder?cwd={urllib.parse.quote(cwd)}" target="hidden-frame">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>
+            <span class="tooltip">Finder: {html.escape(_home_collapse(cwd))}</span>
+        </a>
+    ''')
 
-@dataclass
-class Session:
-    session_id: str
-    project_dir: str
-    cwd: str
-    path: Path
-    start_ts: dt.datetime | None = None
-    end_ts: dt.datetime | None = None
-    title: str = ""
-    first_prompt: str = ""
-    last_prompt: str = ""
-    user_prompts: list[str] = field(default_factory=list)
-    tasks: dict[str, Task] = field(default_factory=dict)
-    user_msg_count: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_create_tokens: int = 0
-    cache_read_tokens: int = 0
+    # Terminal
+    icons.append(f'''
+        <a class="icon-btn" href="/open-terminal?cwd={urllib.parse.quote(cwd)}" target="hidden-frame">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <span class="tooltip">Terminal</span>
+        </a>
+    ''')
 
-    @property
-    def billable_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens + self.cache_create_tokens
+    # Editor (Cursor/VSCode)
+    icons.append(f'''
+        <a class="icon-btn" href="/open-editor?cwd={urllib.parse.quote(cwd)}" target="hidden-frame">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+            <span class="tooltip">Editor (Cursor)</span>
+        </a>
+    ''')
 
-    @property
-    def total_tokens(self) -> int:
-        return self.billable_tokens + self.cache_read_tokens
+    # GitHub
+    if gh_url:
+        icons.append(f'''
+            <a class="icon-btn" href="{gh_url}" target="_blank">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+                <span class="tooltip">GitHub: {html.escape(gh_url.split('/')[-1])}</span>
+            </a>
+        ''')
 
-    @property
-    def incomplete_tasks(self) -> list[Task]:
-        return [t for t in self.tasks.values() if t.status != "completed"]
+    # Notion
+    icons.append(f'''
+        <a class="icon-btn" href="{notion_url}" target="_blank">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="15" x2="15" y2="15"/><line x1="9" y1="11" x2="15" y2="11"/><line x1="9" y1="19" x2="13" y2="19"/></svg>
+            <span class="tooltip">Notion Project</span>
+        </a>
+    ''')
 
-    @property
-    def completed_tasks(self) -> list[Task]:
-        return [t for t in self.tasks.values() if t.status == "completed"]
+    # Augment
+    aug_cls = "ok" if aug_status == "indexed" else ""
+    icons.append(f'''
+        <a class="icon-btn {aug_cls}" href="/augment/index?cwd={urllib.parse.quote(cwd)}" target="hidden-frame">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><path d="M12 6v6l4 2"/></svg>
+            <span class="tooltip">Augment: {aug_status} (Click to index)</span>
+        </a>
+    ''')
 
-
-def decode_project_dir(name: str) -> str:
-    if name.startswith("-"):
-        return "/" + name[1:].replace("-", "/")
-    return name.replace("-", "/")
-
-
-def parse_ts(s):
-    if not s:
-        return None
-    try:
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def extract_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out = []
-        for c in content:
-            if isinstance(c, dict) and c.get("type") == "text":
-                out.append(c.get("text", ""))
-        return "\n".join(out)
-    return ""
-
-
-def is_real_user_prompt(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip()
-    if not t:
-        return False
-    if t.startswith("<command-") or t.startswith("<local-command-"):
-        return False
-    if t.startswith("<system-reminder"):
-        return False
-    if "Caveat: The messages below were generated" in t:
-        return False
-    return True
-
-
-def parse_session(path: Path):
-    project_dir = path.parent.name
-    sess = Session(
-        session_id=path.stem,
-        project_dir=project_dir,
-        cwd=decode_project_dir(project_dir),
-        path=path,
-    )
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    j = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                t = j.get("type")
-                if j.get("cwd"):
-                    sess.cwd = j["cwd"]
-                ts = parse_ts(j.get("timestamp"))
-                if ts:
-                    if sess.start_ts is None or ts < sess.start_ts:
-                        sess.start_ts = ts
-                    if sess.end_ts is None or ts > sess.end_ts:
-                        sess.end_ts = ts
-                if t == "ai-title":
-                    sess.title = j.get("aiTitle", "") or sess.title
-                elif t == "user" and not j.get("isSidechain") and not j.get("isMeta"):
-                    msg = j.get("message", {}) or {}
-                    text = extract_text(msg.get("content", ""))
-                    if is_real_user_prompt(text):
-                        sess.user_msg_count += 1
-                        snippet = text.strip()
-                        if not sess.first_prompt:
-                            sess.first_prompt = snippet
-                        sess.last_prompt = snippet
-                        if len(sess.user_prompts) < 50:
-                            sess.user_prompts.append(snippet)
-                elif t == "assistant" and not j.get("isSidechain"):
-                    msg = j.get("message", {}) or {}
-                    usage = msg.get("usage") or {}
-                    sess.input_tokens += usage.get("input_tokens", 0) or 0
-                    sess.output_tokens += usage.get("output_tokens", 0) or 0
-                    sess.cache_create_tokens += usage.get("cache_creation_input_tokens", 0) or 0
-                    sess.cache_read_tokens += usage.get("cache_read_input_tokens", 0) or 0
-                    for c in msg.get("content", []):
-                        if not isinstance(c, dict):
-                            continue
-                        if c.get("type") != "tool_use":
-                            continue
-                        name = c.get("name")
-                        inp = c.get("input", {}) or {}
-                        if name == "TaskCreate":
-                            tid = str(inp.get("taskId") or len(sess.tasks) + 1)
-                            sess.tasks[tid] = Task(
-                                task_id=tid,
-                                subject=inp.get("subject", ""),
-                                description=inp.get("description", ""),
-                            )
-                        elif name == "TaskUpdate":
-                            tid = str(inp.get("taskId", ""))
-                            if tid in sess.tasks:
-                                status = inp.get("status")
-                                if status:
-                                    sess.tasks[tid].status = status
-    except OSError:
-        return None
-    if sess.start_ts is None:
-        return None
-    return sess
+    return f'<div class="icon-row">{"".join(icons)}<iframe name="hidden-frame" style="display:none"></iframe></div>'
 
 
 def load_sessions(on_date=None, since: dt.date | None = None, until: dt.date | None = None):
-    """Filter sessions by local ending date.
-    - on_date: exact day match
-    - since + until: inclusive range
-    - since only: from that date onwards
-    - until only: up to that date
-    Otherwise return all sessions."""
-    sessions = []
-    if not PROJECTS_DIR.exists():
+    """Query sessions from SQLite."""
+    with database.get_db() as conn:
+        q = "SELECT * FROM sessions"
+        params = []
+        if on_date:
+            q += " WHERE date(start_ts) = ?"
+            params.append(on_date.isoformat())
+        elif since or until:
+            q += " WHERE 1=1"
+            if since:
+                q += " AND date(end_ts) >= ?"
+                params.append(since.isoformat())
+            if until:
+                q += " AND date(end_ts) <= ?"
+                params.append(until.isoformat())
+
+        q += " ORDER BY end_ts DESC"
+        rows = conn.execute(q, params).fetchall()
+
+        sessions = []
+        for r in rows:
+            sid = r['session_id']
+            # Load tasks for this session
+            task_rows = conn.execute("SELECT * FROM tasks WHERE session_id = ?", (sid,)).fetchall()
+            tasks = {tr['task_id']: p.Task(tr['task_id'], tr['subject'], tr['description'], tr['status']) for tr in task_rows}
+
+            sessions.append(p.Session(
+                session_id=sid,
+                project_dir=r['project_dir'],
+                cwd=r['cwd'],
+                path=Path(PROJECTS_DIR) / r['project_dir'] / f"{sid}.jsonl",
+                start_ts=p.parse_ts(r['start_ts']),
+                end_ts=p.parse_ts(r['end_ts']),
+                title=r['title'],
+                first_prompt=r['first_prompt'],
+                last_prompt=r['last_prompt'],
+                tasks=tasks,
+                user_msg_count=r['user_msg_count'],
+                input_tokens=r['input_tokens'],
+                output_tokens=r['output_tokens'],
+                cache_create_tokens=r['cache_create_tokens'],
+                cache_read_tokens=r['cache_read_tokens']
+            ))
         return sessions
-    for proj in PROJECTS_DIR.iterdir():
-        if not proj.is_dir():
-            continue
-        for jsonl in proj.glob("*.jsonl"):
-            s = parse_session(jsonl)
-            if not s:
-                continue
-            local_end = s.end_ts.astimezone().date() if s.end_ts else None
-            if on_date and local_end != on_date:
-                continue
-            if since and (not local_end or local_end < since):
-                continue
-            if until and (not local_end or local_end > until):
-                continue
-            sessions.append(s)
-    sessions.sort(
-        key=lambda s: s.end_ts or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
-        reverse=True,
-    )
-    return sessions
 
 
 def build_project_index(sessions):
@@ -485,6 +449,7 @@ def render_session_card(s: Session) -> str:
     )
     default_open = " open" if incomplete else ""
     tokens_sub = f'<span class="tokens">{fmt_tokens(s.billable_tokens)} tok</span>' if s.billable_tokens else ""
+    icons = render_icon_row(s.cwd, Path(s.cwd).name)
 
     return f"""
     <article class="session {has_incomplete}" id="sid-{s.session_id}" data-sid="{s.session_id}" data-search="{html.escape(search_blob, quote=True)}">
@@ -497,7 +462,10 @@ def render_session_card(s: Session) -> str:
             {tokens_sub}
             {pill}
           </div>
-          <h3>{title}</h3>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <h3 style="flex: 1;">{title}</h3>
+            {icons}
+          </div>
           <div class="sid" title="click to copy" data-sid="{s.session_id}">{s.session_id}</div>
         </summary>
         <section class="prompts">
@@ -795,13 +763,15 @@ def render_page(sessions, start_d, end_d, notion_todos, notion_source, notion_fe
         plural = "s" if len(group) != 1 else ""
         base = Path(cwd).name or cwd
         open_note = f' · <span class="open">{open_in_group} open</span>' if open_in_group else ""
+        icons = render_icon_row(cwd, base)
         project_blocks.append(
             f'<section class="project">'
             f'<h2 class="proj-head">'
             f'<span class="proj-base">{html.escape(base)}</span>'
             f'<span class="proj-path">{html.escape(_home_collapse(cwd))}</span>'
             f'<span class="proj-meta">{len(group)} session{plural}{open_note}</span>'
-            f'</h2>'
+            f"{icons}"
+            f"</h2>"
             f"{cards}</section>"
         )
 
@@ -861,534 +831,7 @@ def render_page(sessions, start_d, end_d, notion_todos, notion_source, notion_fe
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  :root {{
-    --bg: #0c0d0f;
-    --surface: #131418;
-    --surface-2: #1a1c21;
-    --surface-3: #22242a;
-    --line: #26282d;
-    --line-2: #34373c;
-    --line-3: #44474d;
-    --text: #e6e7ea;
-    --dim: #8a8d94;
-    --muted: #54575e;
-    --accent: #cc785c;
-    --accent-hi: #e08c70;
-    --accent-tint: rgba(204,120,92,0.13);
-    --good: #86c39b;
-    --good-tint: rgba(134,195,155,0.12);
-    --warn: #e3b56b;
-    --warn-tint: rgba(227,181,107,0.13);
-    --bad: #e08a82;
-    --bad-tint: rgba(224,138,130,0.12);
-  }}
-  * {{ box-sizing: border-box; }}
-  html, body {{ background: var(--bg); }}
-  body {{
-    margin: 0;
-    color: var(--text);
-    font: 14px/1.55 "IBM Plex Sans", system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    letter-spacing: 0.005em;
-  }}
-  body::before {{
-    content: "";
-    position: fixed; inset: 0;
-    pointer-events: none; z-index: 1;
-    background:
-      radial-gradient(1200px 600px at 80% -10%, rgba(204,120,92,0.04), transparent 60%),
-      radial-gradient(900px 500px at -10% 50%, rgba(134,195,155,0.025), transparent 60%);
-  }}
-
-  /* Header bar */
-  header.top {{
-    position: sticky; top: 0; z-index: 100;
-    background: rgba(12,13,15,0.86);
-    backdrop-filter: blur(12px) saturate(140%);
-    -webkit-backdrop-filter: blur(12px) saturate(140%);
-    border-bottom: 1px solid var(--line);
-    padding: 12px 24px;
-    display: flex; align-items: center;
-    gap: 18px; flex-wrap: wrap;
-  }}
-  .brand {{ display: flex; align-items: center; gap: 10px; }}
-  .brand-dot {{
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--accent);
-    box-shadow: 0 0 10px var(--accent);
-    animation: pulse 2.8s ease-in-out infinite;
-  }}
-  @keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
-  header.top h1 {{
-    font: 600 13px/1 "JetBrains Mono", monospace;
-    margin: 0; color: var(--text);
-    letter-spacing: 0.1em; text-transform: uppercase;
-  }}
-  .brand-sep {{ color: var(--accent); margin: 0 1px; }}
-
-  /* Range picker */
-  .range-picker {{
-    display: flex; align-items: center; gap: 6px;
-    font-family: "JetBrains Mono", monospace; font-size: 12px;
-  }}
-  .range-picker .step {{
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 28px; height: 30px;
-    color: var(--dim);
-    text-decoration: none;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: var(--surface);
-    transition: 80ms;
-  }}
-  .range-picker .step:hover {{ color: var(--accent); border-color: var(--line-2); }}
-  .range-form {{
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 0 6px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: var(--surface);
-    height: 30px;
-  }}
-  .range-form input[type=date] {{
-    background: transparent; border: 0;
-    color: var(--text); font: inherit;
-    padding: 5px 4px;
-    color-scheme: dark;
-    cursor: pointer; outline: none;
-  }}
-  .range-form input[type=date]:focus {{ color: var(--accent); }}
-  .range-form .sep {{ color: var(--muted); font-size: 11px; padding: 0 2px; }}
-  .range-picker .quick {{
-    display: inline-flex;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: var(--surface);
-    overflow: hidden;
-    margin-left: 2px;
-    height: 30px;
-  }}
-  .range-picker .quick a {{
-    padding: 7px 12px;
-    color: var(--dim);
-    text-decoration: none;
-    font-size: 11px;
-    border-right: 1px solid var(--line);
-    transition: 80ms;
-    display: inline-flex; align-items: center;
-  }}
-  .range-picker .quick a:last-child {{ border-right: 0; }}
-  .range-picker .quick a:hover {{ color: var(--text); background: var(--surface-2); }}
-  .range-picker .quick a.active {{ color: var(--accent); background: var(--surface-2); }}
-
-  /* Usage strip */
-  .usage {{
-    display: flex; margin-left: auto;
-    border-left: 1px solid var(--line);
-    font-family: "JetBrains Mono", monospace;
-  }}
-  .usage-block {{
-    padding: 0 16px;
-    border-right: 1px solid var(--line);
-    min-width: 92px;
-    text-align: left;
-  }}
-  .usage-block:last-child {{ border-right: 0; }}
-  .usage-block .lbl {{
-    font-size: 9px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.14em;
-    margin-bottom: 4px;
-  }}
-  .usage-block .val {{
-    font-size: 18px; font-weight: 600; line-height: 1;
-    color: var(--text);
-    font-feature-settings: "tnum","ss01";
-  }}
-  .usage-block .val.good {{ color: var(--good); }}
-  .usage-block .val.warn {{ color: var(--warn); }}
-  .usage-block .val.bad {{ color: var(--bad); }}
-  .usage-block .sub {{ font-size: 10px; color: var(--dim); margin-top: 4px; }}
-
-  /* Layout */
-  main {{
-    display: grid;
-    grid-template-columns: 320px minmax(0, 1fr);
-    position: relative; z-index: 2;
-  }}
-  aside.sidebar {{
-    background: var(--surface);
-    border-right: 1px solid var(--line);
-    padding: 18px 16px;
-    position: sticky; top: 65px;
-    align-self: start;
-    max-height: calc(100vh - 65px);
-    overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: var(--line-2) transparent;
-  }}
-  aside.sidebar::-webkit-scrollbar {{ width: 6px; }}
-  aside.sidebar::-webkit-scrollbar-thumb {{ background: var(--line-2); border-radius: 3px; }}
-
-  .sidebar-head {{
-    display: flex; justify-content: space-between; align-items: baseline;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--line);
-    margin-bottom: 12px;
-  }}
-  .sidebar-head h2 {{
-    font: 600 10px/1 "JetBrains Mono", monospace;
-    color: var(--dim); margin: 0;
-    text-transform: uppercase; letter-spacing: 0.16em;
-  }}
-  .sidebar-meta {{ display: flex; align-items: center; gap: 6px; }}
-  .sidebar-meta .src {{
-    font: 600 9px/1 "JetBrains Mono", monospace;
-    padding: 3px 7px; border-radius: 3px;
-    text-transform: uppercase; letter-spacing: 0.06em;
-  }}
-  .src.ok {{ background: var(--good-tint); color: var(--good); }}
-  .src.stale {{ background: var(--warn-tint); color: var(--warn); }}
-  .src.none {{ background: var(--bad-tint); color: var(--bad); }}
-  button.mini {{
-    font: 9px/1 "JetBrains Mono", monospace;
-    text-transform: uppercase; letter-spacing: 0.06em;
-    padding: 4px 7px;
-    background: var(--surface-2); border: 1px solid var(--line);
-    border-radius: 3px; color: var(--dim); cursor: pointer;
-    transition: 80ms;
-  }}
-  button.mini:hover {{ color: var(--accent); border-color: var(--line-2); }}
-  .counts {{ display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }}
-  .badge {{
-    font: 9px/1 "JetBrains Mono", monospace;
-    padding: 3px 7px; border-radius: 3px;
-    background: var(--surface-3); color: var(--dim);
-    text-transform: uppercase; letter-spacing: 0.06em;
-  }}
-  .badge.warn {{ background: var(--warn-tint); color: var(--warn); }}
-  .badge.bad {{ background: var(--bad-tint); color: var(--bad); }}
-
-  /* Todo groups */
-  .todo-groups {{ display: flex; flex-direction: column; gap: 2px; }}
-  details.todo-group {{ margin: 0; }}
-  details.todo-group > summary {{
-    cursor: pointer;
-    padding: 7px 4px 5px;
-    font: 500 11px/1 "JetBrains Mono", monospace;
-    color: var(--text);
-    text-transform: uppercase; letter-spacing: 0.08em;
-    list-style: none;
-    display: flex; align-items: baseline; gap: 6px;
-    border-radius: 3px;
-  }}
-  details.todo-group > summary::-webkit-details-marker {{ display: none; }}
-  details.todo-group > summary::before {{
-    content: "▸"; color: var(--muted); font-size: 8px;
-  }}
-  details.todo-group[open] > summary::before {{ content: "▾"; }}
-  details.todo-group > summary:hover {{ background: var(--surface-2); }}
-  .proj-name {{
-    flex: 1; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }}
-  .proj-count {{ color: var(--muted); font-weight: 400; font-size: 10px; }}
-
-  ul.todos {{ list-style: none; padding: 0; margin: 0 0 4px; }}
-  .todo details > summary {{
-    cursor: pointer;
-    display: flex; gap: 8px; align-items: center;
-    padding: 5px 6px;
-    list-style: none;
-    font-size: 12px;
-    border-radius: 3px;
-  }}
-  .todo details > summary::-webkit-details-marker {{ display: none; }}
-  .todo details > summary:hover {{ background: var(--surface-2); }}
-  .todo-status {{
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--muted); flex-shrink: 0;
-  }}
-  .todo-status.inprog {{ background: var(--accent); box-shadow: 0 0 6px var(--accent); }}
-  .todo-name {{
-    flex: 1; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }}
-  .todo-due {{
-    font-family: "JetBrains Mono", monospace;
-    font-size: 10px; color: var(--dim); white-space: nowrap;
-  }}
-  .todo.overdue .todo-name {{ color: var(--bad); font-weight: 500; }}
-  .todo.overdue .todo-due {{ color: var(--bad); }}
-  .todo.today .todo-due {{ color: var(--warn); font-weight: 600; }}
-
-  .todo-body {{
-    padding: 4px 8px 8px 22px;
-    display: flex; flex-direction: column; gap: 4px;
-  }}
-  .todo-body form.todo-action {{ display: inline; margin: 0; }}
-  .todo-body form.todo-action button {{
-    font: 10px/1 "JetBrains Mono", monospace;
-    padding: 4px 8px;
-    border: 1px solid var(--line);
-    background: var(--surface-2);
-    border-radius: 3px;
-    cursor: pointer; color: var(--dim);
-    letter-spacing: 0.04em;
-    transition: 80ms;
-  }}
-  .todo-body form.todo-action button:hover {{
-    color: var(--accent); border-color: var(--line-2);
-  }}
-  .todo-source {{ font-size: 11px; color: var(--muted); }}
-  a.todo-source {{ color: var(--dim); text-decoration: none; border-bottom: 1px dashed var(--line-2); }}
-  a.todo-source:hover {{ color: var(--accent); border-color: var(--accent); }}
-  .todo-open {{ font-size: 11px; color: var(--dim); text-decoration: none; }}
-  .todo-open:hover {{ color: var(--accent); }}
-
-  .hint {{ font-size: 11px; color: var(--muted); margin-top: 14px; line-height: 1.5; }}
-  .hint code {{
-    display: block;
-    background: var(--surface-3); color: var(--text);
-    padding: 8px 10px; border-radius: 4px;
-    font: 10px/1.5 "JetBrains Mono", monospace;
-    margin-top: 6px; word-break: break-all;
-    border: 1px solid var(--line);
-  }}
-
-  /* Content area */
-  section.content {{ padding: 22px 28px 60px; max-width: 1100px; }}
-  .content-head {{
-    display: flex; align-items: center; gap: 14px;
-    margin-bottom: 22px; padding-bottom: 12px;
-    border-bottom: 1px dashed var(--line);
-  }}
-  .summary {{
-    margin: 0; color: var(--dim); font-size: 13px; flex: 1;
-  }}
-  .summary .count {{
-    font-family: "JetBrains Mono", monospace;
-    color: var(--text); font-weight: 600;
-  }}
-  .summary .range {{
-    font-family: "JetBrains Mono", monospace;
-    color: var(--accent);
-  }}
-  .summary .open-count {{
-    color: var(--warn);
-    font-family: "JetBrains Mono", monospace;
-    font-weight: 500;
-  }}
-  .filter {{
-    background: var(--surface);
-    border: 1px solid var(--line);
-    color: var(--text);
-    padding: 7px 10px;
-    border-radius: 4px;
-    font: 12px "IBM Plex Sans", sans-serif;
-    width: 220px;
-    outline: none; transition: 120ms;
-  }}
-  .filter:focus {{ border-color: var(--accent); width: 280px; }}
-  .filter::placeholder {{ color: var(--muted); }}
-
-  /* Project section */
-  .project {{ margin-bottom: 32px; }}
-  .proj-head {{
-    display: flex; align-items: baseline; gap: 12px;
-    margin: 0 0 14px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--line);
-    font: 500 15px "IBM Plex Sans", sans-serif;
-  }}
-  .proj-base {{ color: var(--text); font-weight: 600; }}
-  .proj-path {{
-    font-family: "JetBrains Mono", monospace;
-    font-size: 11px; color: var(--muted);
-    letter-spacing: 0.02em;
-  }}
-  .proj-meta {{
-    margin-left: auto;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 10px;
-    text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--dim);
-  }}
-  .proj-meta .open {{ color: var(--warn); }}
-
-  /* Session card */
-  .session {{
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 5px;
-    margin: 8px 0;
-    transition: border-color 120ms, transform 80ms;
-  }}
-  .session:hover {{ border-color: var(--line-2); }}
-  .session.warn {{ border-left: 2px solid var(--accent); }}
-  .session details > summary {{
-    cursor: pointer;
-    list-style: none;
-    padding: 14px 16px;
-    position: relative;
-  }}
-  .session details > summary::-webkit-details-marker {{ display: none; }}
-  .session details > summary::after {{
-    content: "▾";
-    position: absolute; right: 16px; top: 16px;
-    color: var(--muted); font-size: 10px;
-    transition: 80ms;
-  }}
-  .session details:not([open]) > summary::after {{ content: "▸"; }}
-  .session details > summary:hover h3 {{ color: var(--accent); }}
-
-  .session .meta {{
-    display: flex; gap: 10px; align-items: center;
-    font: 10px/1 "JetBrains Mono", monospace;
-    color: var(--dim);
-    margin-bottom: 6px;
-    flex-wrap: wrap;
-    text-transform: uppercase; letter-spacing: 0.06em;
-  }}
-  .session .meta .time {{ color: var(--text); }}
-  .session .meta .duration {{ color: var(--muted); }}
-  .session h3 {{
-    font: 500 14px/1.4 "IBM Plex Sans", sans-serif;
-    margin: 0 30px 4px 0;
-    color: var(--text);
-    transition: color 80ms;
-  }}
-  .session .sid {{
-    font: 10px/1 "JetBrains Mono", monospace;
-    color: var(--muted);
-    letter-spacing: 0.04em;
-    cursor: pointer;
-    display: inline-block;
-    padding: 2px 0;
-  }}
-  .session .sid:hover {{ color: var(--dim); }}
-  .session .sid.copied {{ color: var(--good); }}
-  .session .sid.copied::after {{ content: " ✓ copied"; }}
-
-  .pill {{
-    font: 9px/1 "JetBrains Mono", monospace;
-    padding: 3px 7px; border-radius: 3px;
-    text-transform: uppercase; letter-spacing: 0.06em;
-    border: 1px solid transparent;
-  }}
-  .pill.warn {{ background: var(--warn-tint); color: var(--warn); border-color: rgba(227,181,107,0.25); }}
-  .pill.ok {{ background: var(--good-tint); color: var(--good); border-color: rgba(134,195,155,0.25); }}
-
-  .session details[open] > summary {{ border-bottom: 1px solid var(--line); }}
-  .session details > section,
-  .session details > form {{ padding: 0 16px; }}
-  .session details > section:first-of-type {{ padding-top: 12px; }}
-
-  .prompts {{
-    font-size: 13px; color: var(--text);
-    padding-top: 12px; padding-bottom: 4px;
-  }}
-  .prompt-row {{
-    margin: 4px 0;
-    display: flex; align-items: baseline; gap: 10px;
-  }}
-  .prompt-row .lbl {{
-    font: 9px/1 "JetBrains Mono", monospace;
-    color: var(--muted);
-    letter-spacing: 0.12em; text-transform: uppercase;
-    flex-shrink: 0; width: 32px;
-  }}
-
-  .tasks {{ list-style: none; padding: 0; margin: 4px 0 8px; }}
-  .tasks li {{
-    display: flex; align-items: flex-start; gap: 10px;
-    padding: 6px 0;
-    border-top: 1px dashed var(--line);
-    font-size: 13px;
-  }}
-  .tasks li:first-child {{ border-top: 0; }}
-  .tasks .status {{
-    display: inline-block;
-    min-width: 60px; text-align: center;
-    padding: 2px 6px;
-    font: 9px/1.5 "JetBrains Mono", monospace;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    border-radius: 2px;
-    flex-shrink: 0;
-  }}
-  .tasks .status.completed {{ background: var(--good-tint); color: var(--good); }}
-  .tasks .status.in_progress {{ background: var(--warn-tint); color: var(--warn); }}
-  .tasks .status.pending {{ background: var(--bad-tint); color: var(--bad); }}
-  .tasks .subject {{ flex: 1; color: var(--text); }}
-
-  form.resume {{
-    display: flex; gap: 8px;
-    margin-top: 14px;
-    padding-top: 12px; padding-bottom: 14px;
-    border-top: 1px dashed var(--line);
-  }}
-  form.resume input.prompt-input {{
-    flex: 1;
-    background: var(--bg);
-    color: var(--text);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 7px 10px;
-    font: 13px "IBM Plex Sans", sans-serif;
-    outline: none; transition: 80ms;
-  }}
-  form.resume input.prompt-input:focus {{ border-color: var(--accent); }}
-  form.resume input.prompt-input::placeholder {{ color: var(--muted); }}
-  form.resume button {{
-    background: var(--accent);
-    color: #0c0d0f;
-    border: 0;
-    border-radius: 4px;
-    padding: 7px 16px;
-    font: 600 11px "JetBrains Mono", monospace;
-    text-transform: uppercase; letter-spacing: 0.08em;
-    cursor: pointer; transition: 80ms;
-  }}
-  form.resume button:hover {{ background: var(--accent-hi); }}
-
-  .muted {{
-    color: var(--muted); font-style: italic;
-    padding: 8px 0; font-size: 13px;
-  }}
-
-  .empty {{
-    text-align: center; padding: 80px 0;
-    color: var(--dim);
-  }}
-  .empty-mark {{
-    font: 500 72px/1 "JetBrains Mono", monospace;
-    color: var(--line-2);
-    margin-bottom: 16px;
-  }}
-  .empty p {{ margin: 4px 0; }}
-
-  /* Keyboard hint pill */
-  .kbd {{
-    font: 9px/1 "JetBrains Mono", monospace;
-    padding: 2px 5px;
-    border: 1px solid var(--line-2);
-    border-radius: 3px;
-    color: var(--dim);
-    background: var(--surface);
-    margin: 0 2px;
-  }}
-
-  @media (max-width: 880px) {{
-    main {{ grid-template-columns: 1fr; }}
-    aside.sidebar {{
-      position: static;
-      max-height: none;
-      border-right: 0;
-      border-bottom: 1px solid var(--line);
-    }}
-    .usage {{ margin-left: 0; border-left: 0; }}
-  }}
-</style>
+<link rel="stylesheet" href="/static/style.css">
 </head><body>
 <header class="top">
   <div class="brand">
@@ -1422,63 +865,12 @@ def render_page(sessions, start_d, end_d, notion_todos, notion_source, notion_fe
   </section>
 </main>
 <script>
-(() => {{
-  const PREV = '/?from={prev_from}&to={prev_to}';
-  const NEXT = '/?from={next_from}&to={next_to}';
-  const filter = document.getElementById('filter');
-
-  // Click-to-copy session id
-  document.querySelectorAll('.sid[data-sid]').forEach(el => {{
-    el.addEventListener('click', e => {{
-      e.preventDefault();
-      e.stopPropagation();
-      const sid = el.dataset.sid;
-      if (navigator.clipboard) {{
-        navigator.clipboard.writeText(sid).then(() => {{
-          el.classList.add('copied');
-          setTimeout(() => el.classList.remove('copied'), 1000);
-        }});
-      }}
-    }});
-  }});
-
-  // Client-side filter
-  if (filter) {{
-    const apply = () => {{
-      const q = filter.value.trim().toLowerCase();
-      document.querySelectorAll('.session').forEach(card => {{
-        const blob = card.dataset.search || '';
-        card.style.display = (!q || blob.includes(q)) ? '' : 'none';
-      }});
-      document.querySelectorAll('.project').forEach(p => {{
-        const any = [...p.querySelectorAll('.session')].some(c => c.style.display !== 'none');
-        p.style.display = any ? '' : 'none';
-      }});
-    }};
-    filter.addEventListener('input', apply);
-  }}
-
-  // Keyboard nav
-  document.addEventListener('keydown', e => {{
-    if (e.target.matches('input, textarea')) {{
-      if (e.key === 'Escape' && e.target === filter) {{
-        filter.value = '';
-        filter.dispatchEvent(new Event('input'));
-        filter.blur();
-      }}
-      return;
-    }}
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    if (e.key === 'ArrowLeft') {{ location.href = PREV; }}
-    else if (e.key === 'ArrowRight') {{ location.href = NEXT; }}
-    else if (e.key === 't') {{ location.href = '/'; }}
-    else if (e.key === '/') {{
-      e.preventDefault();
-      filter && filter.focus();
-    }}
-  }});
-}})();
+  window.DASH_CONFIG = {{
+    prevUrl: '/?from={prev_from}&to={prev_to}',
+    nextUrl: '/?from={next_from}&to={next_to}'
+  }};
 </script>
+<script src="/static/app.js"></script>
 </body></html>
 """
 
@@ -1522,12 +914,115 @@ def launch_resume(session_id: str, cwd: str, prompt: str):
         return False, e.stderr.decode("utf-8", errors="replace")
 
 
+def open_finder(cwd: str):
+    try:
+        subprocess.run(["open", cwd], check=True)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def open_editor(cwd: str):
+    # Try cursor first, then code
+    for cmd in ["cursor", "code"]:
+        try:
+            subprocess.run([cmd, cwd], check=True)
+            return True, f"opened with {cmd}"
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            return False, str(e)
+    return False, "cursor/code not found in PATH"
+
+def trigger_augment_index(cwd: str):
+    # Run augment index in background
+    def run():
+        try:
+            # Adjust path to auggie if needed
+            subprocess.run(["/Users/nathan/.nvm/versions/node/v26.1.0/bin/auggie", "index", "--print"], cwd=cwd, check=True)
+            # Update database indexed_at
+            with database.get_db() as conn:
+                conn.execute("INSERT OR REPLACE INTO project_meta(cwd, augment_indexed_at) VALUES (?, ?)",
+                             (cwd, dt.datetime.now().isoformat()))
+        except Exception as e:
+            print(f"Augment index error: {e}")
+
+    threading.Thread(target=run, daemon=True).start()
+    return True, "indexing started"
+
 class Handler(BaseHTTPRequestHandler):
+
     def log_message(self, format, *args):
         pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path.startswith("/static/"):
+            file_path = Path(__file__).parent / parsed.path.lstrip("/")
+            if file_path.exists():
+                self.send_response(200)
+                if file_path.suffix == ".css":
+                    self.send_header("Content-Type", "text/css")
+                elif file_path.suffix == ".js":
+                    self.send_header("Content-Type", "application/javascript")
+                self.end_headers()
+                self.wfile.write(file_path.read_bytes())
+                return
+
+        if parsed.path == "/search":
+            q = params.get("q", [""])[0].strip()
+            if not q:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps([]).encode())
+                return
+
+            results = database.search(q)
+            out = []
+            for r in results:
+                out.append({
+                    "session_id": r["session_id"],
+                    "title": r["title"] or r["first_prompt"][:80] or r["session_id"],
+                    "snippet": r["snippet"],
+                    "cwd": r["cwd"],
+                    "date": p.parse_ts(r["start_ts"]).strftime("%Y-%m-%d %H:%M") if r["start_ts"] else ""
+                })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode())
+            return
+
+        if parsed.path == "/open-finder":
+            cwd = params.get("cwd", [""])[0]
+            open_finder(cwd)
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if parsed.path == "/open-terminal":
+            cwd = params.get("cwd", [""])[0]
+            launch_start(cwd, "")
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if parsed.path == "/open-editor":
+            cwd = params.get("cwd", [""])[0]
+            open_editor(cwd)
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if parsed.path == "/augment/index":
+            cwd = params.get("cwd", [""])[0]
+            trigger_augment_index(cwd)
+            self.send_response(204)
+            self.end_headers()
+            return
+
         if parsed.path == "/":
             qs = urllib.parse.parse_qs(parsed.query)
             today = dt.date.today()
