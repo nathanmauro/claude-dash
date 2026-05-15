@@ -23,17 +23,29 @@ tasks, token usage, and quick-action controls.
 ## Architecture
 
 ```
-dash.py         HTTP server, routing, HTML rendering
-database.py     SQLite schema, incremental FTS5 indexer, search
-parser.py       JSONL parser — produces Session and Task dataclasses
+claude_dash/
+  config.py        constants (paths, port, launchd label)
+  models.py        pydantic v2 models — Task, Session, UsageTotals,
+                   NotionTodo, SearchResult, SubscriptionUsage, …
+  parser.py        JSONL parser → Session
+  db.py            SQLite schema + incremental FTS5 indexer + search
+  indexer.py       background thread (60s interval)
+  notion.py        Notion API client + on-disk cache
+  launcher.py      osascript/Terminal helpers + GitHub/Augment hooks
+  views.py         render_session_card, render_icon_row, formatters
+  render_todos.py  notion sidebar
+  render_usage.py  usage header (today / 7d / range / rate limits)
+  render_page.py   top-level page template
+  server.py        FastAPI app + uvicorn entry point
+  __main__.py      `python -m claude_dash`
 static/
-  style.css     Design system (CSS custom properties, component styles)
-  app.js        Filter, debounced global search, keyboard shortcuts
+  style.css        Design system (CSS custom properties)
+  app.js           Filter, debounced global search, keyboard shortcuts
 ```
 
 The SQLite database lives at `~/.claude-dash/index.db`. On startup the
-server calls `init_db()` to create the schema, then a background thread
-runs `index_all()` every 60 seconds, picking up only files whose `mtime`
+FastAPI app calls `db.init_db()` and `indexer.start()`, which runs
+`db.index_all()` every 60 seconds, picking up only files whose `mtime`
 or `size` has changed.
 
 Search uses FTS5 `trigram` tokenizer (falls back to default tokenizer if
@@ -43,18 +55,13 @@ syntax.
 ## Run
 
 ```
-python3 dash.py
+uv sync
+uv run claude-dash-server
 ```
 
 Server listens on `http://127.0.0.1:8765/` and opens the browser. Port
-can be overridden with `CLAUDE_DASH_PORT`.
-
-CLI listing (useful for verifying the index):
-
-```
-python3 dash.py --list                # today
-python3 dash.py --list 2026-05-12     # specific day
-```
+can be overridden with `CLAUDE_DASH_PORT`. Pass `--no-open` to skip the
+browser launch.
 
 ## How the parser works
 
@@ -79,6 +86,15 @@ session stays untouched.
 
 ## launchd service
 
-Install as a user LaunchAgent to keep the dashboard running in the
-background and restart it on login. The plist should point at `dash.py`
-with `--no-open` to skip the browser auto-launch.
+```
+bin/claude-dash install     # write & load LaunchAgent (RunAtLoad/KeepAlive)
+bin/claude-dash status      # running via LaunchAgent (pid …) → URL
+bin/claude-dash restart     # launchctl kickstart -k
+bin/claude-dash stop        # launchctl bootout
+bin/claude-dash uninstall   # remove the plist
+bin/claude-dash logs        # tail -F ~/.claude-dash/claude-dash.log
+```
+
+The plist invokes `uv run claude-dash-server --no-open` with
+`WorkingDirectory` set to the repo. Override the repo path with
+`CLAUDE_DASH_REPO` or the `uv` binary with `CLAUDE_DASH_UV`.
