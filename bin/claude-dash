@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # claude-dash — start/stop/status the Claude Code session dashboard.
 #
-# By default targets ~/Developer/proj/claude-dash/dash.py. Override with
-# CLAUDE_DASH_PY. Port defaults to 8765, override with CLAUDE_DASH_PORT.
+# Runs `uv run claude-dash-server` from the project repo. Override the repo
+# path with CLAUDE_DASH_REPO. Port defaults to 8765, override with
+# CLAUDE_DASH_PORT.
 
 set -euo pipefail
 
@@ -13,8 +14,9 @@ while [ -L "$SOURCE" ]; do
   SOURCE="$TARGET"
 done
 SELF="$(cd "$(dirname "$SOURCE")" && pwd)"
-DEFAULT_DASH_PY="$(cd "$SELF/.." && pwd)/dash.py"
-DASH_PY="${CLAUDE_DASH_PY:-$DEFAULT_DASH_PY}"
+DEFAULT_REPO="$(cd "$SELF/.." && pwd)"
+REPO_DIR="${CLAUDE_DASH_REPO:-$DEFAULT_REPO}"
+UV_BIN="${CLAUDE_DASH_UV:-/opt/homebrew/bin/uv}"
 CACHE_DIR="$HOME/.claude-dash"
 PID_FILE="$CACHE_DIR/claude-dash.pid"
 LOG_FILE="$CACHE_DIR/claude-dash.log"
@@ -52,7 +54,8 @@ running_pid() {
 }
 
 cmd_run() {
-  exec /usr/bin/env python3 "$DASH_PY" "$@"
+  cd "$REPO_DIR"
+  exec "$UV_BIN" run claude-dash-server "$@"
 }
 
 cmd_start() {
@@ -74,7 +77,8 @@ cmd_start() {
     return 0
   fi
   rm -f "$PID_FILE"
-  nohup /usr/bin/env CLAUDE_DASH_PORT="$PORT" python3 "$DASH_PY" --no-open \
+  cd "$REPO_DIR"
+  nohup env CLAUDE_DASH_PORT="$PORT" "$UV_BIN" run claude-dash-server --no-open \
     >>"$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
@@ -165,11 +169,12 @@ cmd_install() {
   <key>Label</key><string>${LAUNCH_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>python3</string>
-    <string>${DASH_PY}</string>
+    <string>${UV_BIN}</string>
+    <string>run</string>
+    <string>claude-dash-server</string>
     <string>--no-open</string>
   </array>
+  <key>WorkingDirectory</key><string>${REPO_DIR}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CLAUDE_DASH_PORT</key><string>${PORT}</string>
@@ -208,7 +213,7 @@ commands:
   stop           stop background instance
   restart        stop + start
   status         show whether running and the URL
-  run [args...]  run in foreground (passes args to dash.py)
+  run [args...]  run in foreground (uv run claude-dash-server)
   logs           tail -F the log
   open           open the dashboard in the browser
   install        install + load a LaunchAgent (auto-start at login)
@@ -216,7 +221,8 @@ commands:
 
 env:
   CLAUDE_DASH_PORT   server port (default 8765)
-  CLAUDE_DASH_PY     path to dash.py (default ~/Developer/proj/claude-dash/dash.py)
+  CLAUDE_DASH_REPO   path to repo (default \$SELF/..)
+  CLAUDE_DASH_UV     path to uv binary (default /opt/homebrew/bin/uv)
 EOF
 }
 
