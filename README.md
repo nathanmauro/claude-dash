@@ -4,12 +4,18 @@ Local web dashboard for Claude Code sessions. Reads session logs from
 `~/.claude/projects/` and shows all sessions grouped by project, with
 tasks, token usage, and quick-action controls.
 
+A React SPA (Vite + TanStack Query) backed by a FastAPI JSON API. The
+indexer streams change events over Server-Sent Events so new sessions
+appear without a page reload.
+
 ## Features
 
 - Sessions grouped by project, filtered to a date window (default: today)
 - Tasks with completion status; sessions with open tasks pinned to the top
 - **Full-text search** across all session contents — SQLite FTS5 index,
-  sub-millisecond results with highlighted snippets
+  sub-millisecond results with highlighted snippets, inline panel
+- **Live updates** — Server-Sent Events from the background indexer
+  invalidate the dashboard query when new sessions are detected
 - **Interactive icon row** on every project and session card:
   - 📂 Finder — opens the project directory
   - 🖥 Terminal — new Terminal window `cd`'d into the project
@@ -19,6 +25,8 @@ tasks, token usage, and quick-action controls.
   - 🧠 Augment — shows local-index status; click to re-index
 - Direction prompt on each session — submit to relaunch
   `claude --resume <id> "<prompt>"` in a new Terminal window
+- Keyboard shortcuts: `/` focus filter, `Esc` clear, `←`/`→` shift one
+  day, `t` today
 
 ## Architecture
 
@@ -29,24 +37,33 @@ claude_dash/
                    NotionTodo, SearchResult, SubscriptionUsage, …
   parser.py        JSONL parser → Session
   db.py            SQLite schema + incremental FTS5 indexer + search
-  indexer.py       background thread (60s interval)
+  indexer.py       background thread (60s interval) → publishes change events
+  events.py        thread-safe asyncio fan-out (EventBus)
   notion.py        Notion API client + on-disk cache
   launcher.py      osascript/Terminal helpers + GitHub/Augment hooks
-  views.py         render_session_card, render_icon_row, formatters
-  render_todos.py  notion sidebar
-  render_usage.py  usage header (today / 7d / range / rate limits)
-  render_page.py   top-level page template
-  server.py        FastAPI app + uvicorn entry point
+  subscription.py  /api/subscription-usage loader
+  server.py        FastAPI app + uvicorn entry point (JSON API + SSE + SPA)
   __main__.py      `python -m claude_dash`
-static/
-  style.css        Design system (CSS custom properties)
-  app.js           Filter, debounced global search, keyboard shortcuts
+web/
+  src/
+    api.ts                 typed fetchers + types mirroring Pydantic models
+    hooks/                 useDashboard, useTodos, useSearch,
+                           useSubscription, useLiveIndex, useShortcuts,
+                           useToast
+    components/            TopBar, RangePicker, UsageBar, Sidebar,
+                           NotionTodoGroup, NotionTodoItem, ProjectCard,
+                           SessionCard, IconRow, GlobalSearch, Toaster
+    pages/DashboardPage.tsx
+    styles/                tokens.css + layout.css + components/*.css
+    utils/format.ts        fmtTokens, fmtRange, fmtDuration, homeCollapse, …
+  dist/                    built bundle (committed; no node needed at runtime)
 ```
 
 The SQLite database lives at `~/.claude-dash/index.db`. On startup the
 FastAPI app calls `db.init_db()` and `indexer.start()`, which runs
 `db.index_all()` every 60 seconds, picking up only files whose `mtime`
-or `size` has changed.
+or `size` has changed. Each indexer pass that touches sessions publishes
+`{type: "indexed", sids: [...]}` to subscribers of `/api/events`.
 
 Search uses FTS5 `trigram` tokenizer (falls back to default tokenizer if
 your SQLite build omits it) so partial-word matches work without special
@@ -62,6 +79,47 @@ uv run claude-dash-server
 Server listens on `http://127.0.0.1:8765/` and opens the browser. Port
 can be overridden with `CLAUDE_DASH_PORT`. Pass `--no-open` to skip the
 browser launch.
+
+The web bundle in `web/dist/` is committed, so the run flow does not
+require node at runtime.
+
+## Develop the UI
+
+```
+cd web
+npm install
+npm run dev      # vite dev server on :5173, /api proxied to :8765
+```
+
+Run the Python server in another terminal (`uv run claude-dash-server
+--no-open`). Vite proxies `/api/*` to it, so the UI gets hot-reload
+against the live backend.
+
+## Build the UI
+
+```
+cd web
+npm run build    # writes web/dist/
+```
+
+Commit `web/dist/` so end users don't need node installed.
+
+## JSON API
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET    | `/api/dashboard?from=&to=&date=` | sessions + projects + usage + project_index |
+| GET    | `/api/todos`               | Notion todos + source + fetched_at |
+| GET    | `/api/search?q=`           | FTS5 hits with highlighted snippets |
+| GET    | `/api/subscription-usage`  | rate limits + cost |
+| GET    | `/api/events`              | SSE — `{type:"indexed", sids:[...]}` |
+| POST   | `/api/refresh-notion`      | `{ok}` |
+| POST   | `/api/start`               | body `{cwd, prompt?}` |
+| POST   | `/api/resume`              | body `{sid, cwd, prompt?}` |
+| GET    | `/api/open-finder?cwd=`    | open in Finder |
+| GET    | `/api/open-terminal?cwd=`  | new Terminal |
+| GET    | `/api/open-editor?cwd=`    | Cursor / VS Code |
+| GET    | `/api/augment-index?cwd=`  | trigger Augment indexing |
 
 ## How the parser works
 
@@ -80,7 +138,7 @@ Incomplete tasks = anything not `completed` at end of file.
 
 ## Resume
 
-POST to `/resume` runs an `osascript` that opens a new Terminal window
+POST `/api/resume` runs an `osascript` that opens a new Terminal window
 and executes `cd <cwd> && claude --resume <id> [prompt]`. The original
 session stays untouched.
 

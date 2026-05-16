@@ -4,11 +4,26 @@ import datetime as dt
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from .config import DB_PATH, PROJECTS_DIR
 from .models import SearchResult, Session, Task
 from .parser import parse_session, parse_ts
+
+
+def build_project_index(sessions: Iterable[Session]) -> dict[str, tuple[str, str]]:
+    """Map project name and cwd (both lowercased) → (cwd, latest_session_id).
+
+    Used to wire Notion todos to recent project sessions for quick start/resume.
+    """
+    idx: dict[str, tuple[str, str]] = {}
+    for s in sessions:
+        cwd = s.cwd
+        base = Path(cwd).name
+        for key in (cwd.lower(), base.lower()):
+            if key and key not in idx:
+                idx[key] = (cwd, s.session_id)
+    return idx
 
 
 def _row_to_session(r, conn) -> Session:
@@ -150,8 +165,9 @@ def init_db() -> None:
             """)
 
 
-def index_all(projects_dir: Path = PROJECTS_DIR) -> None:
+def index_all(projects_dir: Path = PROJECTS_DIR) -> list[str]:
     init_db()
+    changed: list[str] = []
     with get_db() as conn:
         for proj in projects_dir.iterdir():
             if not proj.is_dir():
@@ -191,6 +207,8 @@ def index_all(projects_dir: Path = PROJECTS_DIR) -> None:
                         "INSERT INTO tasks VALUES (?,?,?,?,?)",
                         (sess.session_id, t.task_id, t.subject, t.description, t.status),
                     )
+                changed.append(sess.session_id)
+    return changed
 
 
 def search(query: str, limit: int = 50) -> list[SearchResult]:

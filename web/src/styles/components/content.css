@@ -1,0 +1,63 @@
+section.content {
+  padding: 22px 28px 60px;
+  max-width: 1100px;
+}
+
+.content-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 22px;
+  padding-bottom: 12px;
+  border-bottom: 1px dashed var(--line);
+  position: relative;
+}
+
+.summary {
+  margin: 0;
+  color: var(--dim);
+  font-size: 13px;
+  flex: 1;
+}
+
+.summary .count {
+  font-family: "JetBrains Mono", monospace;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.summary .range {
+  font-family: "JetBrains Mono", monospace;
+  color: var(--accent);
+}
+
+.summary .open-count {
+  color: var(--warn);
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 500;
+}
+
+.filter-wrap {
+  position: relative;
+}
+
+.filter {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 4px;
+  font: 12px "IBM Plex Sans", sans-serif;
+  width: 220px;
+  outline: none;
+  transition: border-color 120ms, width 120ms;
+}
+
+.filter:focus {
+  border-color: var(--accent);
+  width: 280px;
+}
+
+.filter::placeholder {
+  color: var(--muted);
+}
