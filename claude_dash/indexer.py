@@ -5,12 +5,15 @@ import time
 
 from . import db
 from .config import INDEXER_INTERVAL_S, PROJECTS_DIR
+from .events import bus
 
 
 def _loop() -> None:
     while True:
         try:
-            db.index_all(PROJECTS_DIR)
+            changed = db.index_all(PROJECTS_DIR)
+            if changed:
+                bus.publish({"type": "indexed", "sids": changed})
         except Exception as e:
             print(f"Indexer error: {e}")
         time.sleep(INDEXER_INTERVAL_S)
