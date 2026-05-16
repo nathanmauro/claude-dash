@@ -5,7 +5,7 @@ test("refresh button posts refresh-notion, toasts, and flips source pill", async
   api,
 }) => {
   let todosCalls = 0;
-  await page.route("**/api/todos", async (route) => {
+  await page.route(/\/api\/todos(\?|$)/, async (route) => {
     todosCalls++;
     await route.fulfill({
       json:
@@ -36,7 +36,7 @@ test("refresh button posts refresh-notion, toasts, and flips source pill", async
 });
 
 test("refresh failure shows an error toast", async ({ page }) => {
-  await page.route("**/api/refresh-notion", (route) =>
+  await page.route(/\/api\/refresh-notion(\?|$)/, (route) =>
     route.fulfill({ json: { ok: false } }),
   );
   await gotoDashboard(page);

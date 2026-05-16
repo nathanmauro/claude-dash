@@ -29,7 +29,7 @@ test("SSE indexed event triggers a dashboard refetch without reload", async ({
   });
 
   let dashboardCalls = 0;
-  await page.route("**/api/dashboard*", async (route) => {
+  await page.route(/\/api\/dashboard(\?|$)/, async (route) => {
     dashboardCalls++;
     await route.fulfill({
       json: dashboardCalls === 1 ? initial : withExtra,

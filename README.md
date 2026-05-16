@@ -104,6 +104,29 @@ npm run build    # writes web/dist/
 
 Commit `web/dist/` so end users don't need node installed.
 
+## End-to-end tests
+
+Playwright drives the SPA against `page.route('/api/**', …)` mocks — no
+uvicorn, no `~/.claude/projects/*.jsonl`, and no Notion token required.
+First time:
+
+```
+cd web
+npx playwright install chromium
+```
+
+Then:
+
+```
+npm run test:e2e        # headless
+npm run test:e2e:ui     # interactive runner
+```
+
+Specs live in `web/e2e/` and cover the range picker, Resume, SSE live
+updates, global search, keyboard shortcuts, Notion refresh, responsive
+breakpoint, and session collapsed-state persistence. Fixtures and the
+default mocked API live in `web/e2e/fixtures.ts`.
+
 ## JSON API
 
 | Method | Path | Notes |

@@ -32,7 +32,7 @@ test("Resume submits {sid, cwd, prompt}, toasts, and invalidates dashboard", asy
 });
 
 test("Resume failure shows an error toast", async ({ page }) => {
-  await page.route("**/api/resume", (route) =>
+  await page.route(/\/api\/resume(\?|$)/, (route) =>
     route.fulfill({ json: { ok: false, message: "no terminal" } }),
   );
   await gotoDashboard(page);

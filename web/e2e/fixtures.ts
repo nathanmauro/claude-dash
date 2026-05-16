@@ -10,12 +10,19 @@ import type {
   UsageTotals,
 } from "../src/api";
 
-export const TODAY = new Date().toISOString().slice(0, 10);
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
+function localIso(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+export const TODAY = localIso(new Date());
 
 export function shiftDays(iso: string, days: number): string {
   const d = new Date(iso + "T00:00:00");
   d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  return localIso(d);
 }
 
 export const PROJECT_CWD = "/Users/test/proj/example";
@@ -163,7 +170,7 @@ interface Fixtures {
 }
 
 export const test = base.extend<Fixtures>({
-  api: async ({ page }, use) => {
+  api: [async ({ page }, use) => {
     const state: ApiState = {
       dashboard: makeDashboard(),
       todos: makeTodos(),
@@ -178,29 +185,29 @@ export const test = base.extend<Fixtures>({
       searchRequests: [],
     };
 
-    await page.route("**/api/dashboard*", async (route) => {
+    await page.route(/\/api\/dashboard(\?|$)/, async (route) => {
       state.dashboardRequests++;
       await route.fulfill({
         json: state.dashboard,
         headers: { "Cache-Control": "no-store" },
       });
     });
-    await page.route("**/api/todos", async (route) => {
+    await page.route(/\/api\/todos(\?|$)/, async (route) => {
       state.todosRequests++;
       await route.fulfill({
         json: state.todos,
         headers: { "Cache-Control": "no-store" },
       });
     });
-    await page.route("**/api/search*", async (route) => {
+    await page.route(/\/api\/search(\?|$)/, async (route) => {
       const url = new URL(route.request().url());
       state.searchRequests.push(url.searchParams.get("q") ?? "");
       await route.fulfill({ json: state.search });
     });
-    await page.route("**/api/subscription-usage", (route) =>
+    await page.route(/\/api\/subscription-usage(\?|$)/, (route) =>
       route.fulfill({ json: state.subscription }),
     );
-    await page.route("**/api/events", (route) =>
+    await page.route(/\/api\/events(\?|$)/, (route) =>
       route.fulfill({
         status: 200,
         headers: {
@@ -211,32 +218,32 @@ export const test = base.extend<Fixtures>({
         body: state.events || ": keepalive\n\n",
       }),
     );
-    await page.route("**/api/refresh-notion", async (route) => {
+    await page.route(/\/api\/refresh-notion(\?|$)/, async (route) => {
       state.refreshNotionCount++;
       await route.fulfill({ json: { ok: true } });
     });
-    await page.route("**/api/start", async (route) => {
+    await page.route(/\/api\/start(\?|$)/, async (route) => {
       state.startBodies.push(route.request().postDataJSON());
       await route.fulfill({ json: { ok: true, message: "started" } });
     });
-    await page.route("**/api/resume", async (route) => {
+    await page.route(/\/api\/resume(\?|$)/, async (route) => {
       state.resumeBodies.push(route.request().postDataJSON());
       await route.fulfill({ json: { ok: true, message: "resumed" } });
     });
-    await page.route(/\/api\/open-(finder|terminal|editor)\?/, (route) =>
+    await page.route(/\/api\/open-(finder|terminal|editor)(\?|$)/, (route) =>
       route.fulfill({ json: { ok: true } }),
     );
-    await page.route("**/api/augment-index*", (route) =>
+    await page.route(/\/api\/augment-index(\?|$)/, (route) =>
       route.fulfill({ json: { ok: true } }),
     );
 
     await use(state);
-  },
+  }, { auto: true }],
 });
 
 export { expect };
 
 export async function gotoDashboard(page: Page, query = ""): Promise<void> {
   await page.goto(`/${query}`);
-  await page.getByRole("heading", { level: 3 }).first().waitFor();
+  await page.locator("p.summary").waitFor();
 }

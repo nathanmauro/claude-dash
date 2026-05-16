@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { shiftDate } from "../utils/format";
+import { isoDate, shiftDate } from "../utils/format";
 
 interface ShortcutsOpts {
   filterRef?: React.RefObject<HTMLInputElement | null>;
@@ -37,7 +37,7 @@ export function useShortcuts(opts: ShortcutsOpts = {}) {
           next.set("from", shiftDate(from, days));
           next.set("to", shiftDate(to, days));
         } else {
-          const today = new Date().toISOString().slice(0, 10);
+          const today = isoDate(new Date());
           next.set("date", shiftDate(today, days));
         }
         setParams(next);
